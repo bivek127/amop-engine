@@ -7,6 +7,10 @@ dependencies = [
     "httpx",
     "pydantic",
     "click",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
