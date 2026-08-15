@@ -1,0 +1,26 @@
+[project]
+name = "amop"
+version = "0.0.1"
+description = "AMOP — Autonomous Multi-Agent Operations Platform"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "pydantic",
+    "click",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["amop*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
