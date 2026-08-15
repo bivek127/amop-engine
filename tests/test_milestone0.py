@@ -1,10 +1,16 @@
-import uuid
-
 import pytest
 
 from amop.agents.coder import CoderAgent
 from amop.models.base import BaseLLM, ModelResponse
-from amop.orchestrator.task import Task, TaskState, run_task
+
+# NOTE: this test originally drove the in-memory 3-state stub Task/
+# TaskState/run_task from orchestrator/task.py. Milestone 1 replaced that
+# module with real Postgres persistence and the actual bug_fix state
+# machine (see tests/test_milestone1.py for that coverage) — the stub
+# types no longer exist. What Milestone 0 actually guaranteed — a mocked
+# LLM feeding CoderAgent produces a real AgentResult — is unchanged, since
+# agents/ and models/ were not touched by Milestone 1. Re-pointed at that
+# directly rather than through the now-retired orchestrator API.
 
 
 class FakeLLM(BaseLLM):
@@ -22,13 +28,11 @@ class FakeLLM(BaseLLM):
 
 
 @pytest.mark.asyncio
-async def test_full_loop_task_created_agent_runs_task_done():
-    task = Task(id=str(uuid.uuid4()), prompt="write a fizzbuzz function in python")
-    assert task.state == TaskState.CREATED
-
+async def test_coder_agent_runs_against_mocked_llm():
     agent = CoderAgent(model=FakeLLM())
-    result_task = await run_task(task, agent)
 
-    assert result_task.state == TaskState.DONE
-    assert result_task.output
-    assert result_task.error is None
+    result = await agent.run("write a fizzbuzz function in python")
+
+    assert result.success
+    assert result.output
+    assert result.error is None
