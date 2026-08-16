@@ -10,13 +10,26 @@ extending them wasn't necessary: the protocol only needs to shape the
 prompt and parse response.content, which agents/coder.py already owns).
 The retry-once-on-malformed-JSON behavior spec assigns to the provider's
 parser is replicated here for the same reason.
+
+Milestone 3: run() now wraps the loop in a sandbox session (Section
+9.1's Create -> ... -> Destroy) -- one container per run() call, reused
+across every tool call inside that run, destroyed when it ends
+(including on error, via finally). Tools import from sandbox/tools.py,
+not tools/filesystem.py -- read_file/write_file now execute inside that
+container, not on the host (see sandbox/tools.py's module docstring for
+why the two are never imported together: importing both would let
+whichever loads second silently overwrite the other's registration in
+the shared tool registry).
 """
 
+import asyncio
 import json
 import os
+import uuid
 
 from amop.agents.base import AgentResult, BaseAgent
-from amop.tools import filesystem  # noqa: F401 -- import registers read_file/write_file
+from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers read_file/write_file (sandboxed)
+from amop.sandbox.manager import SandboxManager
 from amop.tools.registry import ToolContext, all_tools, invoke_tool
 
 _RESPONSE_FORMAT_INSTRUCTIONS = (
@@ -73,16 +86,24 @@ def _parse_model_json(content: str) -> tuple[dict | None, str | None]:
 class CoderAgent(BaseAgent):
     name = "coder"
 
-    def __init__(self, model, ctx: ToolContext | None = None) -> None:
+    def __init__(
+        self, model, ctx: ToolContext | None = None, task_id: str | None = None
+    ) -> None:
         super().__init__(model)
         # Section 12.1: single global mode this milestone (no per-repo/
         # per-agent precedence yet). Defaults to "suggestor" -- "observer"
         # would block every write and make tool use pointless to demo.
         self.ctx = ctx or ToolContext(
             agent_name=self.name,
-            scratch_dir=filesystem.SCRATCH_DIR,
+            scratch_dir=sandbox_tools.SCRATCH_DIR,
             mode=os.environ.get("AMOP_PERMISSION_MODE", "suggestor"),
         )
+        # Sandbox container label (Section 9.7.1) -- not a persisted Task
+        # id necessarily; callers that have one (cli/main.py) should pass
+        # it, everything else gets a fresh one per agent instance.
+        self._task_id = task_id or uuid.uuid4().hex
+        self._sandbox_manager: SandboxManager | None = None
+        self.last_container_id: str | None = None
 
     def system_prompt(self) -> str:
         return (
@@ -95,6 +116,46 @@ class CoderAgent(BaseAgent):
         )
 
     async def run(self, prompt: str) -> AgentResult:
+        """Section 9.1's lifecycle around the tool-calling loop below:
+        Create Sandbox -> ... -> Destroy container (default), whichever
+        of task-end/max_lifetime_seconds comes first is enforced by
+        SandboxManager itself. The container is created here (blocking
+        Docker calls off-loaded via asyncio.to_thread so they don't stall
+        the event loop) and always destroyed in `finally`, including on
+        an exception from the loop itself."""
+        if self._sandbox_manager is None:
+            try:
+                self._sandbox_manager = await asyncio.to_thread(SandboxManager)
+            except Exception as exc:
+                return AgentResult(
+                    success=False,
+                    output="",
+                    error=f"sandbox unavailable: {exc}",
+                    iterations_used=0,
+                    tool_calls=[],
+                )
+
+        try:
+            sandbox = await asyncio.to_thread(
+                self._sandbox_manager.create, self._task_id, self.ctx.scratch_dir
+            )
+        except Exception as exc:
+            return AgentResult(
+                success=False,
+                output="",
+                error=f"sandbox unavailable: {exc}",
+                iterations_used=0,
+                tool_calls=[],
+            )
+
+        self.ctx.sandbox = sandbox
+        self.last_container_id = sandbox.short_id
+        try:
+            return await self._run_loop(prompt)
+        finally:
+            await asyncio.to_thread(self._sandbox_manager.destroy, self._task_id)
+
+    async def _run_loop(self, prompt: str) -> AgentResult:
         messages = [
             {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": prompt},

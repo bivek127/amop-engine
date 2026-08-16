@@ -28,11 +28,18 @@ from typing import Any
 class ToolContext:
     """Passed to every tool call and to Safety Engine evaluation.
     Section 12.1's full per-repo/per-agent mode precedence is deferred --
-    `mode` here is this milestone's single global mode."""
+    `mode` here is this milestone's single global mode.
+
+    `sandbox` (Milestone 3): the task's live sandbox.manager.Sandbox, set
+    by the caller (agents/coder.py) once its container is up. Optional
+    and defaulted to None so Milestone 2's ToolContext(...) call sites
+    and tests keep working unchanged; sandboxed tools (sandbox/tools.py)
+    require it to be set."""
 
     agent_name: str
     scratch_dir: Path
     mode: str
+    sandbox: Any = None
 
 
 @dataclass

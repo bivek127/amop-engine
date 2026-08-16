@@ -59,7 +59,7 @@ async def _run(prompt: str, model: str) -> None:
             sys.exit(1)
 
         provider = OllamaProvider(model=model)
-        agent = CoderAgent(model=provider)
+        agent = CoderAgent(model=provider, task_id=str(task.id))
         result = await agent.run(prompt)
 
         task.task_context = {
@@ -75,6 +75,12 @@ async def _run(prompt: str, model: str) -> None:
         click.echo(result.output)
     else:
         click.echo(f"Task failed: {result.error}", err=True)
+
+    # Milestone 3 item 8: which container this run actually executed
+    # inside, not decoration -- absent only if sandbox creation itself
+    # failed (see result.error in that case).
+    click.echo()
+    click.echo(f"Sandbox container: {agent.last_container_id or '(none)'}")
 
     # Visible proof the Safety Engine is actually in the loop (Milestone 2
     # item 6) -- every tool call the agent made, and whether it was
