@@ -10,6 +10,12 @@ class AgentResult(BaseModel):
     output: str
     error: str | None = None
     iterations_used: int
+    # Milestone 2: one entry per tool call made during run(), in order --
+    # {"name":, "args":, "success":, "error_code":, "message":}. Lets a
+    # caller (e.g. the CLI) show which calls were ALLOWED vs DENIED
+    # without needing a persisted audit table. Empty for agents that
+    # don't call tools (e.g. BaseAgent's default single-call run()).
+    tool_calls: list[dict] = []
 
 
 class BaseAgent(ABC):

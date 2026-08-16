@@ -66,6 +66,7 @@ async def _run(prompt: str, model: str) -> None:
             **(task.task_context or {}),
             "output": result.output,
             "error": result.error,
+            "tool_calls": result.tool_calls,
         }
         session.add(task)
         await session.commit()
@@ -74,6 +75,31 @@ async def _run(prompt: str, model: str) -> None:
         click.echo(result.output)
     else:
         click.echo(f"Task failed: {result.error}", err=True)
+
+    # Visible proof the Safety Engine is actually in the loop (Milestone 2
+    # item 6) -- every tool call the agent made, and whether it was
+    # allowed or denied.
+    click.echo()
+    if result.tool_calls:
+        click.echo("Tool calls:")
+        for tc in result.tool_calls:
+            # A tool can also fail for a non-permission reason (NOT_FOUND,
+            # TIMEOUT, ...) -- only error_code == "DENIED" means the
+            # Safety Engine actually blocked it.
+            if tc["error_code"] == "DENIED":
+                status_word = "DENIED"
+            elif tc["success"]:
+                status_word = "ALLOWED"
+            else:
+                status_word = f"ALLOWED (failed: {tc['error_code']})"
+            click.echo(
+                f"  {tc['name']}({tc['args']}) -> {status_word}"
+                + (f"  [{tc['message']}]" if tc["message"] else "")
+            )
+    else:
+        click.echo("Tool calls: (none)")
+
+    if not result.success:
         sys.exit(1)
 
 
