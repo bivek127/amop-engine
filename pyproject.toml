@@ -29,3 +29,9 @@ include = ["amop*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+# tests/fixtures/ holds seeded-buggy repos (Section 19.3) whose suites are
+# SUPPOSED to fail -- they're inputs to the agent chain, not part of AMOP's
+# own suite. Without this they'd get collected and report 2 permanent
+# failures. Defaults are restated because setting this key replaces them.
+norecursedirs = ["fixtures", "*.egg", ".*", "build", "dist", "node_modules", "venv"]

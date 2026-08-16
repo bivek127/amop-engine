@@ -55,10 +55,41 @@ def resolve_mode(agent: str, ctx: ToolContext) -> str:
     return ctx.mode
 
 
+CONTAINER_MOUNT = "/workspace"
+
+
+def strip_container_mount(path: str) -> str:
+    """Translate a container-absolute path into a scratch-relative one.
+
+    Milestone 4: agents are told (truthfully) that the repo is checked
+    out at /workspace, so they refer to files as "/workspace/foo.py".
+    Host-side, that same file lives under the task's scratch directory.
+    Without this translation the Safety Engine reads "/workspace/foo.py"
+    as a real absolute *host* path, finds it outside the scratch dir, and
+    denies the call -- so a model doing exactly what it was told would be
+    locked out of every file. Caught by a live chain run, where the Coder
+    reported back "I'm unable to read or modify the file ... due to
+    permissions restrictions."
+
+    Only an exact "/workspace" or a "/workspace/" prefix is translated,
+    so a lookalike like "/workspaceevil/x" stays absolute and is still
+    denied. Traversal is unaffected: "/workspace/../etc/passwd" becomes
+    "../etc/passwd", which the prefix check below still rejects.
+    """
+    if path == CONTAINER_MOUNT:
+        return ""
+    if path.startswith(CONTAINER_MOUNT + "/"):
+        return path[len(CONTAINER_MOUNT) + 1 :]
+    return path
+
+
 def resolve_within_scratch(path: str, scratch_dir: Path) -> Path | None:
     """Canonicalize `path` (relative or absolute) against `scratch_dir`
     and return the resolved absolute path if it stays inside the
     scratch directory, else None.
+
+    Container-absolute paths (/workspace/...) are translated to
+    scratch-relative first — see strip_container_mount().
 
     Section 12.5.1's requirements, both handled by Path.resolve():
       - path traversal (../../etc/passwd): joining then resolving walks
@@ -75,7 +106,7 @@ def resolve_within_scratch(path: str, scratch_dir: Path) -> Path | None:
     String-level ".." filtering alone is not relied upon anywhere here.
     """
     scratch_dir = scratch_dir.resolve()
-    candidate = (scratch_dir / path).resolve()
+    candidate = (scratch_dir / strip_container_mount(path)).resolve()
     if candidate == scratch_dir or candidate.is_relative_to(scratch_dir):
         return candidate
     return None

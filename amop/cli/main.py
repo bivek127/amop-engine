@@ -1,12 +1,14 @@
 import asyncio
 import sys
 import uuid
+from pathlib import Path
 
 import click
 
 from amop.agents.coder import CoderAgent
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
+from amop.orchestrator.chain import run_fix
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
 
@@ -106,6 +108,99 @@ async def _run(prompt: str, model: str) -> None:
         click.echo("Tool calls: (none)")
 
     if not result.success:
+        sys.exit(1)
+
+
+@app.command()
+@click.option(
+    "--repo",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Path to the repository to fix.",
+)
+@click.option("--description", required=True, help="Plain-text description of the bug.")
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+@click.option(
+    "--mode",
+    default="operator",
+    show_default=True,
+    help="Permission mode for the run (Section 12.1).",
+)
+def fix(repo: str, description: str, model: str, mode: str) -> None:
+    """Run the full agent chain against a repo to fix a described bug."""
+    asyncio.run(_fix(repo, description, model, mode))
+
+
+async def _fix(repo: str, description: str, model: str, mode: str) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        task = await create_task(
+            session,
+            task_type="bug_fix",
+            task_context={"prompt": description, "repo": repo},
+        )
+        click.echo(f"Task {task.id}")
+        click.echo(f"Bug: {description}")
+        click.echo()
+
+        provider = OllamaProvider(model=model)
+        result = await run_fix(
+            session,
+            task,
+            description=description,
+            repo_path=Path(repo),
+            model=provider,
+            mode=mode,
+            emit=lambda message: click.echo(f"  {message}"),
+        )
+
+        task.task_context = {
+            **(task.task_context or {}),
+            "final_state": result.final_state.value,
+            "error": result.error,
+            "stages": result.stages,
+        }
+        session.add(task)
+        await session.commit()
+
+    click.echo()
+    if result.root_cause_report:
+        report = result.root_cause_report
+        click.echo("Root cause report:")
+        click.echo(f"  cause:      {report.root_cause}")
+        click.echo(f"  confidence: {report.confidence}")
+        click.echo(f"  affected:   {report.affected_files}")
+
+    if result.code_change_report:
+        change = result.code_change_report
+        click.echo()
+        click.echo("Code change report (from git, not self-reported):")
+        click.echo(f"  branch:  {change.branch}")
+        click.echo(f"  commit:  {change.commit_sha}")
+        click.echo(f"  files:   {change.files_changed}")
+
+    if result.diff:
+        # PR creation is simulated this milestone -- this is the diff and
+        # summary a PR description would carry, not a GitHub API call.
+        click.echo()
+        click.echo("=" * 62)
+        click.echo(f"SIMULATED PULL REQUEST — {result.code_change_report.branch}")
+        click.echo("=" * 62)
+        if result.root_cause_report:
+            click.echo(f"\n{result.root_cause_report.root_cause}\n")
+        click.echo(result.diff)
+        click.echo("=" * 62)
+
+    click.echo()
+    click.echo(f"Final state: {result.final_state.value}")
+    click.echo(f"Inspect the full history with:  amop status {task.id}")
+
+    if result.final_state is not TaskState.RESOLVED:
         sys.exit(1)
 
 

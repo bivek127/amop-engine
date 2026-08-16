@@ -18,7 +18,7 @@ message=...) -- never a silent no-op.
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -119,18 +119,40 @@ def _validate_args(spec: ToolSpec, args: dict) -> str | None:
 
 
 async def invoke_tool(
-    name: str, args: dict, ctx: ToolContext, agent_name: str
+    name: str,
+    args: dict,
+    ctx: ToolContext,
+    agent_name: str,
+    allowed_tools: Collection[str] | None = None,
 ) -> ToolResult:
-    """The full pipeline for one tool call: validate args -> Safety
-    Engine evaluate -> execute -> normalize -> return. Imports
-    safety.engine.evaluate lazily to avoid a module-import cycle
-    (safety.engine imports ToolSpec/ToolContext from this module)."""
+    """The full pipeline for one tool call: agent tool allowlist ->
+    validate args -> Safety Engine evaluate -> execute -> normalize ->
+    return. Imports safety.engine.evaluate lazily to avoid a
+    module-import cycle (safety.engine imports ToolSpec/ToolContext from
+    this module).
+
+    `allowed_tools` (Milestone 4) is Section 5.1's per-agent tool subset.
+    It's checked first: a tool this agent may not call is refused before
+    its arguments are even inspected, since nothing about the call could
+    make it permissible. None means "no per-agent restriction" (the
+    Milestone 2/3 call sites, unchanged).
+    """
     from amop.safety.engine import evaluate
 
     spec = get_tool(name)
     if spec is None:
         return ToolResult(
             success=False, error_code="UNKNOWN_TOOL", message=f"No such tool: {name}"
+        )
+
+    if allowed_tools is not None and name not in allowed_tools:
+        return ToolResult(
+            success=False,
+            error_code="TOOL_NOT_PERMITTED",
+            message=(
+                f"agent {agent_name!r} may not call {name!r} "
+                f"(permitted: {sorted(allowed_tools)})"
+            ),
         )
 
     validation_error = _validate_args(spec, args)

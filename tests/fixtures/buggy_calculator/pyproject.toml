@@ -1,0 +1,11 @@
+[project]
+name = "buggy-calculator"
+version = "0.1.0"
+description = "AMOP Milestone 4 fixture repo — a small calculator with one seeded bug."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+# Flat layout: calculator.py sits next to test_calculator.py, so the repo
+# root needs to be on sys.path for `from calculator import Calculator`.
+pythonpath = ["."]
+testpaths = ["."]

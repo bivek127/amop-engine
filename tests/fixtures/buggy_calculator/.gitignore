@@ -1,0 +1,7 @@
+# Running the suite inside the sandbox creates these next to the source.
+# Without ignoring them, the orchestrator's `git add -A` would sweep them
+# into the fix commit and the Reviewer's scope check would (correctly!)
+# flag the diff as touching files the root cause never named.
+__pycache__/
+*.pyc
+.pytest_cache/
