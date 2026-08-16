@@ -164,6 +164,7 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
             "final_state": result.final_state.value,
             "error": result.error,
             "stages": result.stages,
+            "tool_calls": result.tool_calls,
         }
         session.add(task)
         await session.commit()
@@ -195,6 +196,26 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
             click.echo(f"\n{result.root_cause_report.root_cause}\n")
         click.echo(result.diff)
         click.echo("=" * 62)
+
+    # Milestone 5's own verification bar: "show the human the tool calls
+    # to prove search was actually used" -- this is what makes that
+    # checkable at all, for `amop fix` and not just `amop run`.
+    click.echo()
+    if result.tool_calls:
+        click.echo("Tool calls:")
+        for tc in result.tool_calls:
+            if tc["error_code"] == "DENIED":
+                status_word = "DENIED"
+            elif tc["success"]:
+                status_word = "ALLOWED"
+            else:
+                status_word = f"ALLOWED (failed: {tc['error_code']})"
+            click.echo(
+                f"  [{tc['agent']}] {tc['name']}({tc['args']}) -> {status_word}"
+                + (f"  [{tc['message']}]" if tc["message"] else "")
+            )
+    else:
+        click.echo("Tool calls: (none)")
 
     click.echo()
     click.echo(f"Final state: {result.final_state.value}")

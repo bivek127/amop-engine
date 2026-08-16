@@ -1,0 +1,9 @@
+[project]
+name = "task-tracker"
+version = "0.1.0"
+description = "AMOP Milestone 5 fixture repo — a small task tracker with one seeded bug, sized to exercise search."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["."]

@@ -34,12 +34,26 @@ class ToolContext:
     by the caller (agents/coder.py) once its container is up. Optional
     and defaulted to None so Milestone 2's ToolContext(...) call sites
     and tests keep working unchanged; sandboxed tools (sandbox/tools.py)
-    require it to be set."""
+    require it to be set.
+
+    `repo_path` / `db_session` (Milestone 5): codebase_intel/search.py's
+    search_code tool needs a stable repo identity to filter code_chunks
+    by (repo_path -- the resolved SOURCE repo path, not scratch_dir; see
+    database/models.py's CodeChunk docstring) and a live DB session for
+    its semantic half. db_session is the SAME AsyncSession the caller
+    (orchestrator/chain.py's run_fix) already holds, reused rather than
+    opening a second engine/connection pool -- safe because the chain is
+    strictly sequential, never concurrent DB access within one task run.
+    Both default to None so every existing ToolContext(...) call site
+    keeps working unchanged; search_code fails cleanly, not silently,
+    when either is unset (see its own docstring)."""
 
     agent_name: str
     scratch_dir: Path
     mode: str
     sandbox: Any = None
+    repo_path: str | None = None
+    db_session: Any = None
 
 
 @dataclass

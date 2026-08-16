@@ -12,6 +12,8 @@ dependencies = [
     "alembic",
     "python-dotenv",
     "docker",
+    "pgvector",
+    "pathspec",
 ]
 
 [project.optional-dependencies]

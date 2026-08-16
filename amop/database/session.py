@@ -1,6 +1,7 @@
 import os
 
 from dotenv import load_dotenv
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -37,7 +38,17 @@ def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 
 
 async def init_db(engine: AsyncEngine) -> None:
-    """Create all tables. Fine for this milestone — real Alembic
-    migrations can wait until the schema needs to evolve."""
+    """Create the vector extension (Milestone 5's code_chunks.embedding
+    column needs it) and all tables. Fine for this milestone — real
+    Alembic migrations can wait until the schema needs to evolve.
+
+    CREATE EXTENSION IF NOT EXISTS is idempotent and safe to run on every
+    startup -- this makes pgvector self-serve for dev and test databases
+    alike instead of a manual step the human has to remember to repeat
+    per database. It has to run before create_all(): the Vector column
+    type can't be created against a database that doesn't have the
+    extension yet.
+    """
     async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)

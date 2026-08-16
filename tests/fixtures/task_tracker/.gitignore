@@ -1,0 +1,8 @@
+# Same rationale as tests/fixtures/buggy_calculator/.gitignore: running
+# the suite inside the sandbox creates these next to the source, and
+# without ignoring them the orchestrator's `git add -A` would sweep them
+# into the fix commit and the Reviewer's scope check would (correctly)
+# flag it.
+__pycache__/
+*.pyc
+.pytest_cache/

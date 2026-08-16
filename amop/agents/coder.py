@@ -31,6 +31,7 @@ from amop.agents.base import (
     BaseAgent,
     render_tool_catalog,
 )
+from amop.codebase_intel import search as search_tool  # noqa: F401 -- registers search_code
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
 from amop.tools.registry import ToolContext
@@ -38,7 +39,7 @@ from amop.tools.registry import ToolContext
 
 class CoderAgent(BaseAgent):
     name = "coder"
-    tools = ("read_file", "write_file", "run_tests")
+    tools = ("read_file", "write_file", "run_tests", "search_code")
     loop_limit = 10
 
     def __init__(
@@ -69,6 +70,12 @@ class CoderAgent(BaseAgent):
             "writing files inside a scratch workspace. Given a description "
             "of a change, use the tools available to make it happen, then "
             "give a final answer summarizing what you did.\n\n"
+            "On a repo with more than a couple of files: use search_code "
+            "with a natural-language or exact-symbol query to find the "
+            "specific code to change, rather than reading files one by "
+            "one. Then read_file on the candidates it returns before "
+            "editing, so your change is grounded in the actual "
+            "surrounding code, not just the chunk search returned.\n\n"
             f"Available tools:\n{render_tool_catalog(self.tools)}\n\n"
             f"{RESPONSE_FORMAT_INSTRUCTIONS}"
         )

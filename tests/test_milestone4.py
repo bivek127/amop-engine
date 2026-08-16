@@ -35,6 +35,7 @@ from amop.database.session import init_db, make_engine, make_session_factory
 from amop.models.base import BaseLLM, ModelResponse
 from amop.orchestrator.chain import (
     MAX_FIX_ITERATIONS,
+    MAX_NOOP_ATTEMPTS,
     enforce_review_checks,
     has_no_citations,
     missing_cited_files,
@@ -213,7 +214,10 @@ def root_cause_answer(confidence: float, affected=None) -> str:
 
 
 def review_answer(
-    approved: bool, reason: str | None = None, addresses_symptom: bool = True
+    approved: bool,
+    reason: str | None = None,
+    addresses_symptom: bool = True,
+    counterexample: str | None = None,
 ) -> str:
     return final(
         {
@@ -231,6 +235,7 @@ def review_answer(
                 }
             ],
             "rejection_reason": reason,
+            "counterexample": counterexample,
         }
     )
 
@@ -448,8 +453,13 @@ async def test_tester_claiming_success_cannot_override_a_failing_suite(session, 
 
     history = await state_history(session, task.id)
     assert TaskState.REVIEWING.value not in history  # never got past testing
-    # The retry budget was actually spent before giving up.
-    assert history.count(TaskState.CODING.value) == MAX_FIX_ITERATIONS + 1
+    # This Coder never makes a single mutating tool call, on any attempt --
+    # that's the no_op guard's budget (MAX_NOOP_ATTEMPTS), not the
+    # test-failure retry budget (MAX_FIX_ITERATIONS): a Coder that isn't
+    # even trying shouldn't get the full fix-iteration budget spent on it.
+    # Ground truth (pytest, not the lying Tester) still decided every one
+    # of those attempts, which is the property this test exists to check.
+    assert history.count(TaskState.CODING.value) == MAX_NOOP_ATTEMPTS
 
 
 # -- reviewer rejection loops back ------------------------------------
@@ -463,6 +473,11 @@ async def test_reviewer_rejection_routes_back_to_coding_with_findings(session, w
         [
             tool_call("write_file", path="calculator.py", content=fixed_calculator_source(scratch)),
             final("first attempt"),
+            # The second attempt must make its own mutating tool call too --
+            # a final_answer with no write_file/patch_file call is a no_op
+            # (Milestone 5 bugfix: chain.py's no_op guard), and would no
+            # longer be forwarded to Reviewer as if it were a fresh diff.
+            tool_call("write_file", path="calculator.py", content=fixed_calculator_source(scratch)),
             final("addressed the review findings"),
         ]
     )
@@ -473,7 +488,16 @@ async def test_reviewer_rejection_routes_back_to_coding_with_findings(session, w
         reviewer=ReviewerAgent(
             ScriptedLLM(
                 [
-                    review_answer(False, "the fix needs a guard for empty input"),
+                    # A real counterexample, so the mechanical override
+                    # (chain._override_ungrounded_rejection) doesn't
+                    # convert this rejection straight to an approval --
+                    # this test is specifically about a *grounded*
+                    # rejection getting addressed on retry.
+                    review_answer(
+                        False,
+                        "the fix needs a guard for empty input",
+                        counterexample="average([]) with 0 items -> raises ZeroDivisionError, should raise ValueError instead",
+                    ),
                     review_answer(True),
                 ]
             ),
@@ -770,13 +794,16 @@ def test_hallucinated_citation_routes_to_needs_human_input_despite_high_confiden
     assert route_after_investigation(report, missing_files=[]) is TaskState.PLANNING_FIX
 
 
-def _verdict(approved: bool, addresses: bool = True) -> ReviewVerdict:
+def _verdict(
+    approved: bool, addresses: bool = True, counterexample: str | None = None
+) -> ReviewVerdict:
     return ReviewVerdict(
         task_id="t",
         approved=approved,
         addresses_reported_symptom=addresses,
         findings=[],
-        rejection_reason=None,
+        rejection_reason="looks wrong to me" if not approved else None,
+        counterexample=counterexample,
     )
 
 
@@ -804,12 +831,101 @@ def test_clean_approval_survives_the_mechanical_checks():
     assert checked.rejection_reason is None
 
 
-def test_mechanical_checks_never_upgrade_a_rejection():
-    # A stricter Reviewer is always respected -- the checks only downgrade.
+def test_downgraded_approval_is_never_re_upgraded_by_the_override():
+    # A stricter Reviewer is always respected for the checks that produce
+    # the downgrade themselves -- out_of_scope/addresses_reported_symptom
+    # are hard facts about the repo, and the override (below) never runs
+    # on their output, only on a rejection the model made unprompted.
     checked = enforce_review_checks(
-        _verdict(approved=False, addresses=True), ["calculator.py"], _report(1.0)
+        _verdict(approved=True, addresses=False), ["calculator.py"], _report(1.0),
+        tests_passed=True,
     )
     assert checked.approved is False
+
+
+# -- mechanical override of an ungrounded rejection --------------------
+#
+# Added after 3 live runs showed the Reviewer rejecting correct,
+# in-scope, test-passing diffs with no identified defect -- 0/9
+# approvals (docs-internal/ROADMAP.md). This is the one check that can
+# turn approved=False into approved=True; every test below pins exactly
+# how narrow that is.
+
+
+def test_ungrounded_rejection_is_overridden_when_tests_pass_and_diff_in_scope():
+    checked = enforce_review_checks(
+        _verdict(approved=False),  # no counterexample
+        ["calculator.py"],
+        _report(1.0),
+        tests_passed=True,
+    )
+    assert checked.approved is True
+    assert "MECHANICALLY OVERRIDDEN" in checked.rejection_reason
+
+
+def test_rejection_with_a_real_counterexample_is_not_overridden():
+    checked = enforce_review_checks(
+        _verdict(
+            approved=False,
+            counterexample=(
+                "urgency=9, impact=8, effort=1 -> score 31.0, but "
+                "urgency=2, impact=1, effort=10 (score 8.0) should not "
+                "outrank it and does"
+            ),
+        ),
+        ["calculator.py"],
+        _report(1.0),
+        tests_passed=True,
+    )
+    assert checked.approved is False
+
+
+def test_rejection_is_not_overridden_when_tests_are_failing():
+    checked = enforce_review_checks(
+        _verdict(approved=False), ["calculator.py"], _report(1.0), tests_passed=False
+    )
+    assert checked.approved is False
+
+
+def test_rejection_is_not_overridden_when_the_diff_is_out_of_scope():
+    checked = enforce_review_checks(
+        _verdict(approved=False),
+        ["calculator.py", "test_calculator.py"],
+        _report(1.0),  # affected_files=["calculator.py"] only
+        tests_passed=True,
+    )
+    assert checked.approved is False
+
+
+def test_rejection_is_not_overridden_when_nothing_was_declared_affected():
+    # No affected_files means there's nothing to confirm the diff stayed
+    # in scope against -- refuse to guess, same call the pre-existing
+    # out_of_scope_files() makes for the downgrade direction.
+    checked = enforce_review_checks(
+        _verdict(approved=False), ["calculator.py"], _report(1.0, affected=[]),
+        tests_passed=True,
+    )
+    assert checked.approved is False
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (None, False),
+        ("", False),
+        ("looks wrong to me", False),  # no digits -- not a real input/output pair
+        ("this diff is bad", False),
+        ("urgency=9, impact=8, effort=1 -> score 31.0, too high", True),
+    ],
+)
+def test_has_concrete_counterexample_is_a_format_check_not_a_correctness_check(
+    text, expected
+):
+    from amop.orchestrator.chain import _has_concrete_counterexample
+
+    assert _has_concrete_counterexample(_verdict(approved=False, counterexample=text)) is (
+        expected
+    )
 
 
 def test_review_verdict_requires_an_explicit_symptom_answer():

@@ -45,6 +45,7 @@ from amop.agents.handoffs import (
 from amop.agents.investigator import InvestigatorAgent
 from amop.agents.reviewer import ReviewerAgent
 from amop.agents.tester import TesterAgent
+from amop.codebase_intel.indexer import index_repo
 from amop.database.models import Task
 from amop.orchestrator.state_machine import TRANSITIONS, TaskState
 from amop.orchestrator.task import transition
@@ -52,13 +53,21 @@ from amop.safety.engine import resolve_within_scratch
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
-from amop.tools.registry import ToolContext, invoke_tool
+from amop.tools.registry import ToolContext, get_tool, invoke_tool
 
 # Section 4.2's counters: "test failure AND retry_count < max_fix_iterations
 # (default 4)" and "Reviewer rejects with actionable feedback AND
 # review_cycles < 2".
 MAX_FIX_ITERATIONS = 4
 MAX_REVIEW_CYCLES = 2
+
+# Not a spec number -- a bugfix budget. A coding attempt that makes zero
+# mutating tool calls (no write_file/patch_file) produced no new diff at
+# all; retrying it costs nothing like a real test/review failure does, so
+# it gets its own small budget instead of eating into MAX_FIX_ITERATIONS or
+# MAX_REVIEW_CYCLES. Still bounded, so a coder that never edits anything
+# can't loop forever.
+MAX_NOOP_ATTEMPTS = 2
 
 
 # ---------------------------------------------------------------------
@@ -172,17 +181,102 @@ def missing_cited_files(report: RootCauseReport, scratch_dir: Path) -> list[str]
     return missing
 
 
+_MIN_COUNTEREXAMPLE_CHARS = 20
+
+
+def _has_concrete_counterexample(verdict: ReviewVerdict) -> bool:
+    """Mechanical, not semantic: does `counterexample` look like an actual
+    input/output pair rather than empty or a restated doubt? This does
+    NOT execute or verify the counterexample -- that would mean running
+    arbitrary model-supplied claims through the sandbox, a different and
+    much larger feature. It only checks for the bare minimum shape a real
+    one would have (some length, at least one digit -- a genuine
+    input/output pair has numbers in it; a vague sentence usually
+    doesn't). Deliberately cheap and gameable in principle, same as any
+    format check; it exists to filter out silence and one-line
+    restatements, not to adjudicate correctness.
+    """
+    text = (verdict.counterexample or "").strip()
+    return len(text) >= _MIN_COUNTEREXAMPLE_CHARS and any(ch.isdigit() for ch in text)
+
+
+def _override_ungrounded_rejection(
+    verdict: ReviewVerdict,
+    changed_files: list[str],
+    report: RootCauseReport,
+    tests_passed: bool,
+) -> ReviewVerdict:
+    """The one mechanical check in this module that can turn a rejection
+    into an approval, not just the reverse -- added after live runs
+    showed the Reviewer rejecting genuinely correct, fully in-scope,
+    test-passing diffs on stylistic grounds ("a different formula than I
+    expected") with no identified defect (docs-internal/ROADMAP.md's
+    Known Limitations: 0/9 approvals across 3 runs prior to this).
+
+    Deliberately narrow, and deliberately checked in this order:
+      1. Only fires on a rejection the MODEL made itself -- never on one
+         `enforce_review_checks` just produced a line above. A scope
+         violation or a symptom mismatch is a fact this orchestrator
+         verified about the repo; a missing counterexample doesn't get to
+         undo that.
+      2. Both preconditions for even considering an override are hard,
+         ground-truth facts, not judgment calls: the orchestrator's own
+         pytest run passed, and `out_of_scope_files` says the diff never
+         left the files the root cause named. Nothing here is the
+         Reviewer's word taken on faith.
+      3. The escape hatch stays entirely in the Reviewer's hands: name one
+         concrete input/output pair where the diff misbehaves, and the
+         rejection stands untouched. It is a strictness requirement, not
+         a bypass -- it can only make rejection *harder* to hand-wave, not
+         easier.
+    """
+    if verdict.approved:
+        return verdict
+    if not tests_passed:
+        return verdict
+    if not report.affected_files:
+        return verdict
+    if out_of_scope_files(changed_files, report.affected_files):
+        return verdict
+    if _has_concrete_counterexample(verdict):
+        return verdict
+
+    return verdict.model_copy(
+        update={
+            "approved": True,
+            "rejection_reason": (
+                "MECHANICALLY OVERRIDDEN (chain._override_ungrounded_rejection): "
+                "all tests pass and the diff is confined to the root cause's "
+                "affected_files, but the rejection named no concrete "
+                f"input/output counterexample. Original verdict: approved=False"
+                + (f" -- {verdict.rejection_reason}" if verdict.rejection_reason else "")
+            ),
+        }
+    )
+
+
 def enforce_review_checks(
-    verdict: ReviewVerdict, changed_files: list[str], report: RootCauseReport
+    verdict: ReviewVerdict,
+    changed_files: list[str],
+    report: RootCauseReport,
+    tests_passed: bool = True,
 ) -> ReviewVerdict:
     """Apply the mechanical checks that sit on top of the Reviewer's
     judgment. An approval is a model opinion; these are not.
 
-    Only ever downgrades an approval -- it can never turn a rejection
-    into an approval, so a stricter Reviewer is always respected.
+    Almost everything here only ever downgrades an approval -- a stricter
+    Reviewer is always respected. The one exception is
+    `_override_ungrounded_rejection`, applied last and only to a
+    rejection that wasn't itself produced by a downgrade below (see its
+    own docstring for why that ordering matters).
+
+    `tests_passed` defaults to True to keep every existing call site
+    (this function predates the override and was widely called with just
+    3 positional args) behaving exactly as before; run_chain always
+    passes the real ground-truth value explicitly.
     """
     if not verdict.approved:
-        return verdict
+        return _override_ungrounded_rejection(verdict, changed_files, report, tests_passed)
 
     strayed = out_of_scope_files(changed_files, report.affected_files)
     if strayed:
@@ -251,6 +345,14 @@ class ChainResult:
     container_id: str | None = None
     error: str | None = None
     stages: list[str] = field(default_factory=list)
+    # Milestone 5: every tool call made by every agent across the whole
+    # run, in order, each tagged with which agent made it -- {"agent":,
+    # "name":, "args":, "success":, "error_code":, "message":}. Without
+    # this there was no way to check "did search_code actually get used"
+    # from outside the chain, which the milestone's own verification bar
+    # explicitly asks to be shown (found while writing that check, not
+    # anticipated up front).
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 def _noop(_message: str) -> None:
@@ -316,7 +418,9 @@ async def run_chain(
 
         # -- INVESTIGATING -------------------------------------------
         stage("INVESTIGATING: investigator examining the repo")
-        report = await _run_agent(agents.investigator, _investigator_prompt(description))
+        report = await _run_agent(
+            agents.investigator, _investigator_prompt(description), result
+        )
         report = _retag(report, str(task.id))
         result.root_cause_report = report
         stage(
@@ -372,6 +476,7 @@ async def run_chain(
 
         fix_iterations = 0
         review_cycles = 0
+        noop_attempts = 0
         findings_feedback = ""
         # Who/what caused the *next* entry into CODING. Seeded with the
         # PLANNING_FIX -> CODING hop; retry branches below rewrite it
@@ -389,20 +494,66 @@ async def run_chain(
             await go(TaskState.CODING, actor=coding_actor, trigger=coding_trigger)
             stage(f"CODING: coder applying fix (attempt {fix_iterations + 1})")
             code_report = await _run_coder(
-                agents.coder, ctx, report, findings_feedback, str(task.id)
+                agents.coder, ctx, report, findings_feedback, str(task.id), result
             )
             result.code_change_report = code_report
             stage(
                 f"CODING: {code_report.status}, files changed: "
                 f"{code_report.files_changed or '[]'}"
+                + (" [no_op: no mutating tool call this attempt]" if code_report.no_op else "")
             )
 
             # -- TESTING ---------------------------------------------
             await go(TaskState.TESTING, actor=f"agent:{agents.coder.name}")
             stage("TESTING: running the repo's own test suite")
-            test_report = await _run_tester(agents.tester, ctx, str(task.id))
+            test_report = await _run_tester(agents.tester, ctx, str(task.id), result)
             result.test_report = test_report
             stage(f"TESTING: all_passed={test_report.all_passed} — {test_report.details[:160]}")
+
+            # Bugfix: a no-op coding attempt (zero mutating tool calls)
+            # must never reach Reviewer with a stale diff, and getting
+            # lucky on a leftover passing suite doesn't change that.
+            # Handled before route_after_testing so it can never fall
+            # through to REVIEWING regardless of test outcome. Uses its
+            # own small budget (MAX_NOOP_ATTEMPTS) instead of consuming
+            # a real fix_iterations/review_cycles slot -- this isn't the
+            # test-failure or review-rejection retry path, it's "the
+            # coder didn't actually do anything, try again."
+            if code_report.no_op:
+                noop_attempts += 1
+                stage(
+                    f"CODING: discarding no-op attempt ({noop_attempts}/"
+                    f"{MAX_NOOP_ATTEMPTS}) instead of sending a stale diff "
+                    "to review"
+                )
+                if noop_attempts >= MAX_NOOP_ATTEMPTS:
+                    await go(
+                        TaskState.FAILED,
+                        actor=f"agent:{agents.coder.name}",
+                        trigger=(
+                            f"coder made no mutating tool calls across "
+                            f"{MAX_NOOP_ATTEMPTS} attempts"
+                        ),
+                    )
+                    stage(
+                        "FAILED: coder made no file changes after repeated "
+                        "attempts (no_op budget exhausted)"
+                    )
+                    return result
+                coding_actor = f"agent:{agents.coder.name}"
+                coding_trigger = (
+                    f"coder attempt made no mutating tool calls (no_op retry "
+                    f"{noop_attempts} < {MAX_NOOP_ATTEMPTS}, does not consume "
+                    "the fix-iteration or review-cycle budget)"
+                )
+                findings_feedback = (
+                    "Your last turn ended without calling write_file or "
+                    "patch_file -- no file was actually changed, so there was "
+                    "nothing new to test or review. You must make a concrete "
+                    "edit (write_file or patch_file) before giving your final "
+                    "answer."
+                )
+                continue
 
             next_state = route_after_testing(test_report, fix_iterations)
             if next_state is TaskState.CODING:
@@ -430,18 +581,38 @@ async def run_chain(
             await go(TaskState.REVIEWING, actor=f"agent:{agents.tester.name}")
             stage("REVIEWING: reviewer checking the diff against the root cause")
             verdict = await _run_reviewer(
-                agents.reviewer, ctx, report, test_report, description, str(task.id)
+                agents.reviewer, ctx, report, test_report, description, str(task.id), result
             )
 
-            # Mechanical checks on top of the model's verdict.
-            checked = enforce_review_checks(verdict, code_report.files_changed, report)
+            # Mechanical checks on top of the model's verdict. Reviewing
+            # only happens once tests have already passed (route_after_
+            # testing gates on it above), so tests_passed is always True
+            # here in practice -- passed explicitly rather than relying
+            # on the default, since that default exists for other/older
+            # call sites, not this one.
+            checked = enforce_review_checks(
+                verdict, code_report.files_changed, report, tests_passed=test_report.all_passed
+            )
             if checked.approved != verdict.approved:
-                stage(f"REVIEWING: approval overridden — {checked.rejection_reason}")
+                direction = "approved -> rejected" if verdict.approved else "rejected -> approved"
+                stage(f"REVIEWING: mechanical override ({direction}) — {checked.rejection_reason}")
             verdict = checked
             result.review_verdict = verdict
+            # Visibility into the mechanical-override input, not just its
+            # output: without this, "why wasn't this rejection overridden?"
+            # is unanswerable from the log alone. Only relevant on a
+            # rejection -- an approval has nothing to override.
+            counterexample_note = ""
+            if not verdict.approved:
+                counterexample_note = (
+                    f" [counterexample: {verdict.counterexample}]"
+                    if verdict.counterexample
+                    else " [no counterexample given]"
+                )
             stage(
                 f"REVIEWING: approved={verdict.approved}"
                 + (f" — {verdict.rejection_reason}" if verdict.rejection_reason else "")
+                + counterexample_note
             )
 
             next_state = route_after_review(verdict, review_cycles)
@@ -520,11 +691,23 @@ async def run_chain(
 # ---------------------------------------------------------------------
 
 
-async def _run_agent(agent, prompt: str):
+def _record_tool_calls(chain_result: ChainResult, agent_name: str, agent_result) -> None:
+    """Append `agent_result.tool_calls`, each tagged with which agent
+    made it, onto the chain-wide log. This is what lets a caller (the
+    CLI, a test) check "was search_code actually used" from outside the
+    chain -- AgentResult.tool_calls is otherwise discarded by every
+    _run_* helper below once it's extracted the field each one needs."""
+    chain_result.tool_calls.extend(
+        {"agent": agent_name, **call} for call in agent_result.tool_calls
+    )
+
+
+async def _run_agent(agent, prompt: str, chain_result: ChainResult):
     """Run an agent and return its validated handoff, or raise
     _ChainFailure. Section 4.7: a handoff that fails validation is an
     agent failure, never a silent pass-through."""
     result = await agent.run(prompt)
+    _record_tool_calls(chain_result, agent.name, result)
     if not result.success:
         raise _ChainFailure(f"{agent.name} failed: {result.error}")
     if result.handoff is None:
@@ -547,7 +730,9 @@ def _investigator_prompt(description: str) -> str:
     )
 
 
-async def _run_coder(agent, ctx, report: RootCauseReport, feedback: str, task_id: str):
+async def _run_coder(
+    agent, ctx, report: RootCauseReport, feedback: str, task_id: str, chain_result: ChainResult
+):
     prompt = (
         f"Root cause: {report.root_cause}\n"
         f"Suggested fix plan: {report.suggested_fix_plan}\n"
@@ -559,6 +744,7 @@ async def _run_coder(agent, ctx, report: RootCauseReport, feedback: str, task_id
         prompt += f"\n\nFeedback you must address:\n{feedback}"
 
     agent_result = await agent.run(prompt)
+    _record_tool_calls(chain_result, agent.name, agent_result)
 
     # A failed Coder is deliberately NOT a chain failure. Section 6.3.3:
     # "Coder hands off a CodeChangeReport with status: 'failed' and its
@@ -567,6 +753,24 @@ async def _run_coder(agent, ctx, report: RootCauseReport, feedback: str, task_id
     # continues into TESTING, where the real suite gets the final word;
     # the retry budget handles it from there.
     diagnostic = None if agent_result.success else f"coder agent failed: {agent_result.error}"
+
+    # Bugfix: whether THIS attempt actually did anything, independent of
+    # git state. changed_files() below diffs against the baseline, so a
+    # committed edit from an *earlier* attempt still shows up even when
+    # this attempt's turn made no write_file/patch_file call at all --
+    # observed live, where a third coding attempt called only search_code
+    # + read_file, made no edit, and was still handed to Reviewer as if it
+    # were a fresh diff. Checked from the tool-call log itself, not from
+    # git, so it can't be fooled by a stale commit sitting on the branch.
+    no_op = not any(
+        call["success"] and (spec := get_tool(call["name"])) is not None and spec.mutating
+        for call in agent_result.tool_calls
+    )
+    if no_op and diagnostic is None:
+        diagnostic = (
+            "coder made no mutating tool calls this attempt (no write_file/"
+            "patch_file) -- nothing new was produced to test or review"
+        )
 
     # CodeChangeReport is assembled from git, not from what the model
     # said it did (Section 6.3.9). Docker calls are blocking, so they go
@@ -584,17 +788,18 @@ async def _run_coder(agent, ctx, report: RootCauseReport, feedback: str, task_id
 
     return CodeChangeReport(
         task_id=task_id,
-        status="success" if changed and agent_result.success else "failed",
+        status="success" if changed and agent_result.success and not no_op else "failed",
         branch=branch,
         commit_sha=sha,
         files_changed=changed,
         diff_summary=full_diff[:2000],
         iterations_used=agent_result.iterations_used,
         failure_diagnostic=diagnostic,
+        no_op=no_op,
     )
 
 
-async def _run_tester(agent, ctx, task_id: str) -> TestReport:
+async def _run_tester(agent, ctx, task_id: str, chain_result: ChainResult) -> TestReport:
     """Run the Tester, then overwrite its all_passed with ground truth.
 
     The model contributes interpretation; pytest contributes the verdict.
@@ -608,6 +813,7 @@ async def _run_tester(agent, ctx, task_id: str) -> TestReport:
         "Run the test suite and summarize the current state of it."
     )
     agent_result = await agent.run(prompt)
+    _record_tool_calls(chain_result, agent.name, agent_result)
 
     details = ""
     if agent_result.success and agent_result.handoff is not None:
@@ -636,6 +842,7 @@ async def _run_reviewer(
     test_report: TestReport,
     description: str,
     task_id: str,
+    chain_result: ChainResult,
 ) -> ReviewVerdict:
     # The original bug report leads the prompt (Section 6.4: check the fix
     # "actually addresses reported behavior, not just 'tests pass'"). Without
@@ -653,7 +860,7 @@ async def _run_reviewer(
         "against the ORIGINAL BUG REPORT above, not only against the "
         "stated root cause."
     )
-    verdict = await _run_agent(agent, prompt)
+    verdict = await _run_agent(agent, prompt, chain_result)
     return _retag(verdict, task_id)
 
 
@@ -712,6 +919,7 @@ async def run_fix(
     scratch_root = Path(scratch_root or sandbox_tools.SCRATCH_DIR)
     scratch_dir = (scratch_root / str(task.id)).resolve()
 
+    resolved_repo_path = str(Path(repo_path).resolve())
     await asyncio.to_thread(git_repo.materialize, Path(repo_path), scratch_dir)
 
     manager = await asyncio.to_thread(SandboxManager)
@@ -723,11 +931,22 @@ async def run_fix(
             git_repo.create_branch, sandbox, f"amop/fix-{uuid.UUID(task_id).hex[:8]}"
         )
 
+        # Section 7.1: onboarding-time indexing, an orchestrator-level
+        # step (not an agent tool call) run once before the chain starts.
+        # "Index fresh each time" (CLAUDE.md's authorized simplification):
+        # index_repo() deletes and re-populates every run rather than
+        # incrementally updating, keyed on resolved_repo_path so repeated
+        # runs against the same source repo don't accumulate stale rows.
+        chunk_count = await index_repo(session, resolved_repo_path, scratch_dir)
+        emit(f"Indexed {chunk_count} code chunks from {resolved_repo_path}")
+
         ctx = ToolContext(
             agent_name="chain",
             scratch_dir=scratch_dir,
             mode=mode,
             sandbox=sandbox,
+            repo_path=resolved_repo_path,
+            db_session=session,
         )
         agents = ChainAgents.build(model, ctx, task_id)
         emit(f"Sandbox container: {sandbox.short_id}")

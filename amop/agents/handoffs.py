@@ -84,6 +84,16 @@ class CodeChangeReport(BaseModel):
     diff_summary: str = ""
     iterations_used: int = 0
     failure_diagnostic: str | None = None
+    # Milestone 5 bugfix: True when this coding attempt made zero
+    # successful mutating tool calls (no write_file/patch_file). Set by
+    # the orchestrator from the tool-call log, never the model. Exists
+    # because files_changed/status alone can't distinguish "this attempt
+    # produced a fix" from "an earlier attempt's commit is still sitting
+    # on the branch and this attempt did nothing" -- changed_files() diffs
+    # against the baseline, not against the start of this attempt, so it
+    # stays non-empty either way. A caller must check no_op before
+    # trusting status=="success" as "this attempt did something".
+    no_op: bool = False
     # Deferred from 6.3.10: scope_justification (needs the edit-plan
     # declaration step, 6.3.9, not built), test_result (carried
     # separately as TestReport this milestone).
@@ -108,7 +118,14 @@ class Finding(BaseModel):
     """One Reviewer objection (6.5)."""
 
     severity: Literal["low", "medium", "high", "critical"]
-    description: str
+    description: str = Field(
+        description=(
+            "Must quote the exact offending code verbatim from the diff, "
+            "plus what is concretely wrong with it. A restated doubt with "
+            "no quoted code (e.g. 'does not address the root cause') is "
+            "not a valid finding."
+        )
+    )
     file: str | None = None
     line: int | None = None
 
@@ -140,4 +157,29 @@ class ReviewVerdict(BaseModel):
     approved: bool
     addresses_reported_symptom: bool
     findings: list[Finding] = Field(default_factory=list)
-    rejection_reason: str | None = None
+    rejection_reason: str | None = Field(
+        default=None,
+        description=(
+            "Required when approved=false. Must quote the exact offending "
+            "line(s) from the diff verbatim, with file/line, and state "
+            "concretely what is wrong with that code. A generic restatement "
+            "of doubt with no quoted code is not a valid rejection reason."
+        ),
+    )
+    counterexample: str | None = Field(
+        default=None,
+        description=(
+            "A concrete INPUT -> OUTPUT pair showing the diff produces "
+            "wrong behavior, e.g. 'urgency=9, impact=8, effort=1 -> "
+            "compute_priority_score returns 31.0, but a task with "
+            "urgency=2, impact=1, effort=10 (score 8.0) should NOT "
+            "outrank it, and with this diff it does'. Optional when you "
+            "approve. When you reject a diff where the test suite already "
+            "passes and the change is confined to the affected files, "
+            "this is what makes the rejection actionable -- without one, "
+            "chain.py's mechanical review checks override the rejection "
+            "to an approval, because a passing, in-scope diff with no "
+            "identified counterexample gives a human nothing concrete to "
+            "act on that the tests haven't already settled."
+        ),
+    )
