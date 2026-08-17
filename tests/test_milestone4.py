@@ -53,7 +53,7 @@ from amop.orchestrator.task import create_task, get_transitions
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
-from amop.tools.registry import ToolContext, invoke_tool
+from amop.tools.registry import ToolContext, ToolResult, get_tool, invoke_tool
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://localhost/amop_test"
@@ -263,6 +263,37 @@ async def session(engine):
         )
 
 
+@pytest.fixture(autouse=True)
+def _fake_github(monkeypatch):
+    """Milestone 6: PR_CREATION now calls the real create_pull_request tool
+    (amop/tools/github.py) instead of Milestone 4's simulated print. Left
+    unmocked, every test in this file that drives the chain to a genuine
+    fix would attempt a REAL network push + GitHub API call against
+    github.com/bivek127/amop-sandbox -- GITHUB_TOKEN loads from .env via
+    amop.database.session's import-time load_dotenv() call, so it's
+    present even though nothing here opts into AMOP_E2E_GITHUB. This
+    file's tests predate GitHub entirely and have no reason to touch it,
+    so the registered tool's function is faked here: the chain still
+    exercises real PR_CREATION routing (a genuine ToolResult flows back
+    through invoke_tool, WAITING_FOR_APPROVAL is a real transition, not a
+    skip) without ever making a network call. Autouse -- every test in
+    this file gets this, since GitHub involvement is incidental to what
+    all of them are actually testing.
+    """
+
+    async def _fake_create_pull_request(title, body, head, base, ctx):
+        return ToolResult(
+            success=True,
+            output={
+                "url": "https://github.com/bivek127/amop-sandbox/pull/999",
+                "number": 999,
+                "created": True,
+            },
+        )
+
+    monkeypatch.setattr(get_tool("create_pull_request"), "func", _fake_create_pull_request)
+
+
 @pytest.fixture
 def workspace(tmp_path):
     """A materialized fixture repo in a real container, git-initialized
@@ -367,7 +398,10 @@ async def test_confidence_at_threshold_proceeds_to_coding(session, workspace):
 
     history = await state_history(session, task.id)
     assert TaskState.CODING.value in history
-    assert result.final_state is TaskState.RESOLVED
+    # Milestone 6: a successful chain now ends at WAITING_FOR_APPROVAL (a
+    # real PR opened, human must merge) rather than the old simulated
+    # MERGED -> RESOLVED path.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL
 
 
 # -- the happy path ---------------------------------------------------
@@ -397,7 +431,12 @@ async def test_full_chain_resolves_and_touches_only_the_buggy_file(session, work
         agents=agents,
     )
 
-    assert result.final_state is TaskState.RESOLVED, result.error
+    # Milestone 6: a successful chain now ends at WAITING_FOR_APPROVAL (a
+    # real PR opened, human must merge) rather than the old simulated
+    # MERGED -> RESOLVED path -- see the _fake_github fixture for why this
+    # PR creation doesn't touch the real network.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
+    assert result.pr_url == "https://github.com/bivek127/amop-sandbox/pull/999"
 
     # The full legal path was walked, in order, with no shortcuts.
     assert await state_history(session, task.id) == [
@@ -408,8 +447,7 @@ async def test_full_chain_resolves_and_touches_only_the_buggy_file(session, work
         TaskState.TESTING.value,
         TaskState.REVIEWING.value,
         TaskState.PR_CREATION.value,
-        TaskState.MERGED.value,
-        TaskState.RESOLVED.value,
+        TaskState.WAITING_FOR_APPROVAL.value,
     ]
 
     # Diff scope: only the buggy file, read from git rather than claimed.
@@ -513,7 +551,9 @@ async def test_reviewer_rejection_routes_back_to_coding_with_findings(session, w
     # REVIEWING -> CODING happened, then the second review approved.
     assert history.count(TaskState.CODING.value) == 2
     assert history.count(TaskState.REVIEWING.value) == 2
-    assert result.final_state is TaskState.RESOLVED
+    # Milestone 6: WAITING_FOR_APPROVAL, not RESOLVED -- see
+    # test_confidence_at_threshold_proceeds_to_coding's comment.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL
 
     # Section 6.5: the findings reach the next Coder invocation verbatim.
     later_prompts = "".join(
@@ -696,8 +736,12 @@ async def test_real_model_chain_fixes_the_seeded_bug(session, tmp_path):
         emit=print,
     )
 
-    # Asserted on outcome, not on reasoning text (19.3).
-    assert result.final_state is TaskState.RESOLVED, result.error
+    # Asserted on outcome, not on reasoning text (19.3). Milestone 6:
+    # WAITING_FOR_APPROVAL, not RESOLVED -- this test is about whether
+    # Ollama actually fixes the bug, not about GitHub, so create_pull_
+    # request is faked here too (see _fake_github) rather than adding a
+    # second live-network dependency to an already-slow real-model test.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
     assert result.code_change_report.files_changed == ["calculator.py"]
     workspace = tmp_path / str(task.id)
     assert FIXED_LINE in (workspace / "calculator.py").read_text()

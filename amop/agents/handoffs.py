@@ -77,7 +77,7 @@ class CodeChangeReport(BaseModel):
     """
 
     task_id: str
-    status: Literal["success", "failed"]
+    status: Literal["success", "failed", "needs_decomposition"]
     branch: str
     commit_sha: str | None = None
     files_changed: list[str] = Field(default_factory=list)
@@ -97,6 +97,12 @@ class CodeChangeReport(BaseModel):
     # Deferred from 6.3.10: scope_justification (needs the edit-plan
     # declaration step, 6.3.9, not built), test_result (carried
     # separately as TestReport this milestone).
+    #
+    # Milestone 6, Section 29.1: "needs_decomposition" is set by the
+    # ORCHESTRATOR (orchestrator/chain.py), never the Coder model, when
+    # safety/scope_guard.py's line-count cap is exceeded -- same
+    # ground-truth-not-self-report rule as every other mechanically
+    # observable field on this model.
 
 
 class TestReport(BaseModel):
@@ -110,8 +116,18 @@ class TestReport(BaseModel):
     task_id: str
     all_passed: bool
     details: str = ""
-    # Deferred from 6.4: new_tests_added / regression_confirmed (Tester
-    # authoring regression tests is out of scope this milestone).
+    # Milestone 6, Section 29.1's flaky-test carve-out: a test named in
+    # the original bug report, or a test Tester itself just wrote as a
+    # regression test, must NEVER be excluded as flaky even if it fails
+    # on both branches (see agents/tester.py's is_carveout_protected).
+    # Both fields are always empty/False in a live run today -- Tester
+    # has no write_file tool and Section 6.4's full regression-authoring
+    # ("red before green") behavior is not built this milestone -- but
+    # the carve-out logic that reads them is built correctly now, not
+    # deferred, per an explicit decision to keep it defensively correct
+    # ahead of the feature that will one day populate it.
+    new_tests_added: list[str] = Field(default_factory=list)
+    regression_confirmed: bool = False
 
 
 class Finding(BaseModel):

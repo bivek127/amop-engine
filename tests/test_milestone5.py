@@ -431,10 +431,28 @@ async def test_investigator_cannot_write_files_even_with_search_code_added(
     os.environ.get("AMOP_E2E_OLLAMA") != "1",
     reason="real-model E2E: set AMOP_E2E_OLLAMA=1 (needs Ollama running)",
 )
-async def test_real_model_chain_fixes_the_seeded_bug_using_search(session, tmp_path):
+async def test_real_model_chain_fixes_the_seeded_bug_using_search(session, tmp_path, monkeypatch):
     from amop.models.ollama import OllamaProvider
     from amop.orchestrator.chain import run_fix
     from amop.orchestrator.state_machine import TaskState
+    from amop.tools.registry import ToolResult, get_tool
+
+    # Milestone 6: PR_CREATION now calls the real create_pull_request tool,
+    # which would otherwise attempt a genuine GitHub push/API call here.
+    # This test is about whether Ollama actually fixes the bug using
+    # search, not about GitHub -- faked so AMOP_E2E_OLLAMA=1 alone (no
+    # AMOP_E2E_GITHUB, no real network) is still sufficient to run it.
+    async def _fake_create_pull_request(title, body, head, base, ctx):
+        return ToolResult(
+            success=True,
+            output={
+                "url": "https://github.com/bivek127/amop-sandbox/pull/999",
+                "number": 999,
+                "created": True,
+            },
+        )
+
+    monkeypatch.setattr(get_tool("create_pull_request"), "func", _fake_create_pull_request)
 
     task = await create_task(session, task_type="bug_fix")
     stages = []
@@ -448,7 +466,9 @@ async def test_real_model_chain_fixes_the_seeded_bug_using_search(session, tmp_p
         emit=stages.append,
     )
 
-    assert result.final_state is TaskState.RESOLVED, result.error
+    # Milestone 6: WAITING_FOR_APPROVAL, not RESOLVED -- a real chain now
+    # stops after a real PR is opened (faked above), never auto-merges.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
     assert result.code_change_report.files_changed == ["priority.py"]
 
     workspace = tmp_path / str(task.id)

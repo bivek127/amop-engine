@@ -13,6 +13,7 @@ Reviewer look, without re-cloning.
 """
 
 import shutil
+import subprocess
 from pathlib import Path
 
 from amop.sandbox.manager import Sandbox
@@ -60,17 +61,41 @@ def _git(sandbox: Sandbox, args: str, timeout: float = 60.0, check: bool = True)
 
 
 def init_baseline(sandbox: Sandbox) -> str:
-    """`git init` + commit the pristine tree as the baseline on `main`.
+    """`git init` + commit the pristine tree as the baseline on `main`, OR,
+    if the materialized source already has real git history (a real
+    clone, not a bare fixture directory), reuse that history instead.
 
-    This is what makes the fixture a real git repo. It happens per run,
-    inside the container, rather than being checked into AMOP's own repo
-    -- a nested .git would be stored by the parent repo as a gitlink
-    (mode 160000) and the fixture's files would never actually be
-    committed. See the fixture's README.
+    The fixture-repo case is what makes a fixture a real git repo in the
+    first place -- it happens per run, inside the container, rather than
+    being checked into AMOP's own repo (a nested .git would be stored by
+    the parent repo as a gitlink, mode 160000, and the fixture's files
+    would never actually be committed; see the fixture's README).
+
+    Milestone 6: when the source repo materialize() copied already has a
+    `.git` (a real clone -- e.g. of a real PR-target repo), synthesizing
+    a fresh, disconnected one-commit history on top of it would make
+    every branch Coder creates share NO common ancestor with the real
+    remote's base branch -- and GitHub's create_pull_request API hard-
+    rejects that ("branch has no history in common with main"), no
+    matter how correct the diff is. So: reuse real history when it's
+    there instead of stomping a synthetic one on top of it. This changes
+    nothing for the fixture-repo case (no fixture under tests/fixtures/
+    has a .git), only for a real clone.
     """
-    _git(sandbox, f"init -b {BASE_BRANCH}")
-    _git(sandbox, "add -A")
-    _git(sandbox, "commit -m 'baseline: fixture repo as seeded'")
+    already_a_repo = (
+        sandbox.exec_run(
+            f"cd {WORKSPACE} && git rev-parse --is-inside-work-tree", timeout=10
+        ).exit_code
+        == 0
+    )
+    if already_a_repo:
+        _git(sandbox, f"checkout {BASE_BRANCH}")
+    else:
+        _git(sandbox, f"init -b {BASE_BRANCH}")
+
+    if has_changes(sandbox):
+        _git(sandbox, "add -A")
+        _git(sandbox, "commit -m 'baseline: fixture repo as seeded'")
     return current_sha(sandbox)
 
 
@@ -129,3 +154,71 @@ def changed_files(sandbox: Sandbox, base: str = BASE_BRANCH) -> list[str]:
 def _shell_quote(value: str) -> str:
     escaped = value.replace("'", "'\\''")
     return f"'{escaped}'"
+
+
+# ---------------------------------------------------------------------
+# Milestone 6: base-branch checkout/restore, for the flaky-test
+# double-check's re-run-against-base cycle (Section 29.1). Matches
+# Section 6.4's own documented mechanism for its "red before green"
+# regression-test check -- "a throwaway git stash/checkout inside the
+# sandbox" -- reused here for the same reason: never destroy a Coder
+# attempt's uncommitted state just to look at how a test behaves on main.
+# ---------------------------------------------------------------------
+
+
+def stash_if_dirty(sandbox: Sandbox) -> bool:
+    """Stash working-tree changes (including untracked files) before a
+    throwaway checkout. Returns True iff something was actually stashed,
+    so the caller knows whether to pop it back afterward."""
+    if not has_changes(sandbox):
+        return False
+    _git(sandbox, "stash push --include-untracked")
+    return True
+
+
+def checkout(sandbox: Sandbox, ref: str) -> None:
+    _git(sandbox, f"checkout {ref}")
+
+
+def pop_stash(sandbox: Sandbox) -> None:
+    _git(sandbox, "stash pop")
+
+
+# ---------------------------------------------------------------------
+# Milestone 6: the one deliberate exception to this module's "every git
+# command runs in the container, never on the host" invariant (see module
+# docstring above). The sandbox container runs network_mode="none"
+# (sandbox/manager.py) -- it has no route to github.com at all -- so the
+# fix branch cannot be pushed from inside it. host_scratch_dir is the
+# exact same on-disk directory the container bind-mounts at /workspace
+# (sandbox/manager.py's Manager.create), so a host-side git process sees
+# precisely the branch/history the container wrote, with no re-clone
+# needed. Every OTHER function in this module stays container-only.
+# ---------------------------------------------------------------------
+
+
+def push_to_remote(
+    host_scratch_dir: Path, remote_url: str, branch: str, timeout: float = 60.0
+) -> None:
+    """Push `branch` (as-is, same name on both ends) to `remote_url` from
+    the host.
+
+    `remote_url` should carry auth embedded as
+    https://x-access-token:<token>@github.com/<owner>/<repo>.git rather
+    than being registered via `git remote add` -- that way the token is
+    never written to .git/config on disk. Callers MUST mask the token out
+    of any error text raised here before it reaches a ToolResult.message
+    or a log line: git's own stderr sometimes echoes the remote URL
+    verbatim on failure.
+    """
+    result = subprocess.run(
+        ["git", "push", remote_url, f"{branch}:{branch}"],
+        cwd=host_scratch_dir,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise GitError(
+            f"git push failed (exit {result.returncode}): {result.stderr.strip()}"
+        )

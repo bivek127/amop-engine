@@ -185,17 +185,26 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
         click.echo(f"  commit:  {change.commit_sha}")
         click.echo(f"  files:   {change.files_changed}")
 
-    if result.diff:
-        # PR creation is simulated this milestone -- this is the diff and
-        # summary a PR description would carry, not a GitHub API call.
+    if result.pr_url:
+        # result.pr_url is GitHub's own html_url -- never contains
+        # GITHUB_TOKEN, safe to print as-is. Any future diagnostic output
+        # that touches the token itself must go through
+        # amop.tools.github._mask_token first (Section 12.5: never print
+        # a token in full).
         click.echo()
         click.echo("=" * 62)
-        click.echo(f"SIMULATED PULL REQUEST — {result.code_change_report.branch}")
+        click.echo("PULL REQUEST OPENED")
         click.echo("=" * 62)
-        if result.root_cause_report:
-            click.echo(f"\n{result.root_cause_report.root_cause}\n")
+        click.echo(f"  {result.pr_url}")
+        click.echo("=" * 62)
+    elif result.diff:
+        # No PR opened -- either a blocked/failed create_pull_request call
+        # (result.error explains why, printed below) or the chain never
+        # reached PR_CREATION. Show the diff so there's still something to
+        # inspect, clearly labeled as not a pull request.
+        click.echo()
+        click.echo(f"Diff (no PR opened -- final state {result.final_state.value}):")
         click.echo(result.diff)
-        click.echo("=" * 62)
 
     # Milestone 5's own verification bar: "show the human the tool calls
     # to prove search was actually used" -- this is what makes that
@@ -218,10 +227,23 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
         click.echo("Tool calls: (none)")
 
     click.echo()
+    if result.error:
+        click.echo(f"Error: {result.error}")
     click.echo(f"Final state: {result.final_state.value}")
     click.echo(f"Inspect the full history with:  amop status {task.id}")
 
-    if result.final_state is not TaskState.RESOLVED:
+    # Milestone 6: a successful run now legitimately ends at
+    # WAITING_FOR_APPROVAL (PR opened, human must merge -- no auto-merge)
+    # rather than RESOLVED, which nothing in this milestone's chain
+    # reaches anymore. NEEDS_HUMAN_INPUT is "not broken, needs attention"
+    # (a low-confidence investigation, an oversized diff, a blocked/failed
+    # PR creation) -- distinct from a hard FAILED/CANCELLED, so it gets
+    # its own exit code rather than being lumped in with real failure.
+    if result.final_state in (TaskState.WAITING_FOR_APPROVAL, TaskState.RESOLVED):
+        pass
+    elif result.final_state is TaskState.NEEDS_HUMAN_INPUT:
+        sys.exit(2)
+    else:
         sys.exit(1)
 
 

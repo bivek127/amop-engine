@@ -34,6 +34,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from amop.agents import tester as tester_mod
 from amop.agents.coder import CoderAgent
 from amop.agents.handoffs import (
     CONFIDENCE_THRESHOLD,
@@ -49,11 +50,13 @@ from amop.codebase_intel.indexer import index_repo
 from amop.database.models import Task
 from amop.orchestrator.state_machine import TRANSITIONS, TaskState
 from amop.orchestrator.task import transition
+from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
-from amop.tools.registry import ToolContext, get_tool, invoke_tool
+from amop.tools import github as github_tools  # noqa: F401 -- registers create_pull_request/get_ci_status
+from amop.tools.registry import ToolContext, ToolResult, get_tool, invoke_tool
 
 # Section 4.2's counters: "test failure AND retry_count < max_fix_iterations
 # (default 4)" and "Reviewer rejects with actionable feedback AND
@@ -342,6 +345,10 @@ class ChainResult:
     test_report: TestReport | None = None
     review_verdict: ReviewVerdict | None = None
     diff: str = ""
+    # Milestone 6: the real GitHub PR URL, set once create_pull_request
+    # succeeds. None when no PR was opened (blocked, failed, or the task
+    # never reached PR_CREATION).
+    pr_url: str | None = None
     container_id: str | None = None
     error: str | None = None
     stages: list[str] = field(default_factory=list)
@@ -493,7 +500,7 @@ async def run_chain(
             # re-enter a state it's already in.
             await go(TaskState.CODING, actor=coding_actor, trigger=coding_trigger)
             stage(f"CODING: coder applying fix (attempt {fix_iterations + 1})")
-            code_report = await _run_coder(
+            code_report, full_diff = await _run_coder(
                 agents.coder, ctx, report, findings_feedback, str(task.id), result
             )
             result.code_change_report = code_report
@@ -503,10 +510,52 @@ async def run_chain(
                 + (" [no_op: no mutating tool call this attempt]" if code_report.no_op else "")
             )
 
+            # Milestone 6, Section 29.1: diff-size cap, extending Section
+            # 6.3.9's existing file-scope guard with a hard line-of-code
+            # ceiling. Checked after-the-fact here (reusing the diff
+            # _run_coder already computed) rather than proactively inside
+            # CoderAgent's loop -- a smaller, lower-risk change, still a
+            # real code-enforced gate: an oversized edit never reaches
+            # TESTING, let alone PR_CREATION. Only checked on a genuine,
+            # trusted new diff (status == "success") -- a no_op/failed
+            # attempt is handled by its own retry path below regardless of
+            # how large a stale earlier-attempt diff happens to be.
+            if code_report.status == "success" and scope_guard.over_cap(full_diff):
+                loc = scope_guard.changed_line_count(full_diff)
+                code_report = code_report.model_copy(
+                    update={
+                        "status": "needs_decomposition",
+                        "failure_diagnostic": (
+                            f"diff is {loc} changed lines, exceeding the "
+                            f"{scope_guard.MAX_LOC_PER_TASK}-line cap (Section 29.1)"
+                        ),
+                    }
+                )
+                result.code_change_report = code_report
+                stage(
+                    f"CODING: diff exceeds size cap ({loc} > "
+                    f"{scope_guard.MAX_LOC_PER_TASK}) -- needs_decomposition"
+                )
+                await go(
+                    TaskState.NEEDS_HUMAN_INPUT,
+                    actor=f"agent:{agents.coder.name}",
+                    trigger=(
+                        f"diff exceeds coder.max_loc_per_task cap "
+                        f"({loc} > {scope_guard.MAX_LOC_PER_TASK})"
+                    ),
+                )
+                stage(
+                    "NEEDS_HUMAN_INPUT: diff too large for one task -- "
+                    "decompose into smaller changes"
+                )
+                return result
+
             # -- TESTING ---------------------------------------------
             await go(TaskState.TESTING, actor=f"agent:{agents.coder.name}")
             stage("TESTING: running the repo's own test suite")
-            test_report = await _run_tester(agents.tester, ctx, str(task.id), result)
+            test_report = await _run_tester(
+                agents.tester, ctx, str(task.id), result, description
+            )
             result.test_report = test_report
             stage(f"TESTING: all_passed={test_report.all_passed} — {test_report.details[:160]}")
 
@@ -638,38 +687,44 @@ async def run_chain(
                 return result
             break
 
-        # -- PR_CREATION (simulated) ---------------------------------
+        # -- PR_CREATION -----------------------------------------------
+        # Milestone 6: real GitHub PR creation, replacing the Milestone
+        # 4/5 simulated print. On success the task goes to
+        # WAITING_FOR_APPROVAL, never MERGED -- auto-merge is explicitly
+        # not built this milestone; a human must review and merge the
+        # real PR on GitHub themselves.
         await go(TaskState.PR_CREATION, actor=f"agent:{agents.reviewer.name}")
         result.diff = await _get_diff(ctx)
-        stage("PR_CREATION: (simulated — no GitHub API call this milestone)")
+        stage("PR_CREATION: opening a real pull request on GitHub")
 
-        # Section 4.2: PR_CREATION -> MERGED requires "mode >= operator
-        # and auto_merge". The doc's "PR_CREATION -> RESOLVED" is not a
-        # legal edge, so the chain takes the real path through MERGED.
-        await go(
-            TaskState.MERGED,
-            actor="system",
-            trigger="mode >= operator and auto_merge:true (simulated merge, no remote)",
+        pr_result = await _create_pull_request(
+            ctx, report, code_report, result.diff, str(task.id)
         )
-        stage("MERGED: fix committed on the working branch (merge simulated locally)")
-
-        # MERGED -> RESOLVED's trigger is "post-merge checks pass", so
-        # the suite is genuinely re-run here rather than assumed green.
-        post_merge = await _run_tests_ground_truth(ctx)
-        if not post_merge["all_passed"]:
-            await go(
-                TaskState.CANCELLED,
-                actor="system",
-                trigger="post-merge checks failed",
+        if not pr_result.success:
+            stage(
+                f"PR_CREATION: failed to open PR -- "
+                f"{pr_result.error_code}: {pr_result.message}"
             )
-            stage("CANCELLED: post-merge test run did not pass")
+            await go(
+                TaskState.NEEDS_HUMAN_INPUT,
+                actor="system",
+                trigger=f"create_pull_request failed: {pr_result.error_code}",
+            )
+            result.error = pr_result.message
+            stage(f"NEEDS_HUMAN_INPUT: PR creation blocked/failed ({pr_result.error_code})")
             return result
 
-        await go(TaskState.RESOLVED, actor="system")
-        stage(
-            f"RESOLVED: post-merge suite green "
-            f"({post_merge['passed']} passed, {post_merge['failed']} failed)"
+        result.pr_url = pr_result.output.get("url")
+        stage(f"PR_CREATION: opened {result.pr_url}")
+        await go(
+            TaskState.WAITING_FOR_APPROVAL,
+            actor="system",
+            trigger=(
+                "create_pull_request succeeded (auto-merge not implemented "
+                "this milestone -- human-gated)"
+            ),
         )
+        stage("WAITING_FOR_APPROVAL: a human must review and merge the real PR on GitHub")
         return result
 
     except _ChainFailure as exc:
@@ -732,7 +787,7 @@ def _investigator_prompt(description: str) -> str:
 
 async def _run_coder(
     agent, ctx, report: RootCauseReport, feedback: str, task_id: str, chain_result: ChainResult
-):
+) -> tuple[CodeChangeReport, str]:
     prompt = (
         f"Root cause: {report.root_cause}\n"
         f"Suggested fix plan: {report.suggested_fix_plan}\n"
@@ -786,7 +841,7 @@ async def _run_coder(
     if not changed and diagnostic is None:
         diagnostic = "coder made no file changes"
 
-    return CodeChangeReport(
+    code_report = CodeChangeReport(
         task_id=task_id,
         status="success" if changed and agent_result.success and not no_op else "failed",
         branch=branch,
@@ -797,14 +852,26 @@ async def _run_coder(
         failure_diagnostic=diagnostic,
         no_op=no_op,
     )
+    return code_report, full_diff
 
 
-async def _run_tester(agent, ctx, task_id: str, chain_result: ChainResult) -> TestReport:
+async def _run_tester(
+    agent, ctx, task_id: str, chain_result: ChainResult, description: str = ""
+) -> TestReport:
     """Run the Tester, then overwrite its all_passed with ground truth.
 
     The model contributes interpretation; pytest contributes the verdict.
     A Tester that claims success while the suite is red cannot move the
     task forward, because the value the router reads never came from it.
+
+    Milestone 6, Section 29.1: the flaky-test double-check. Any test that
+    failed against the fix branch and ISN'T carve-out-protected (not named
+    in the original bug report, not one Tester just wrote) gets re-run
+    against the base branch; if it fails there too, it's excluded from
+    `all_passed`/`details` as environmental noise rather than real signal.
+    This is glue code around agents/tester.py's pure classify_failures --
+    all the checkout/re-run/restore I/O lives here, outside the model's
+    control, matching how ground_truth itself is computed.
     """
     ground_truth = await _run_tests_ground_truth(ctx)
 
@@ -816,23 +883,100 @@ async def _run_tester(agent, ctx, task_id: str, chain_result: ChainResult) -> Te
     _record_tool_calls(chain_result, agent.name, agent_result)
 
     details = ""
+    handoff_new_tests: list[str] = []
+    regression_confirmed = False
     if agent_result.success and agent_result.handoff is not None:
         details = agent_result.handoff.details
+        handoff_new_tests = agent_result.handoff.new_tests_added
+        regression_confirmed = agent_result.handoff.regression_confirmed
     else:
         # A failed Tester agent is not a failed task: the authoritative
         # result already exists. Record the degradation instead of
         # discarding a perfectly good pytest run.
         details = f"(tester agent unavailable: {agent_result.error})"
 
-    if ground_truth["failures"]:
-        failed_names = ", ".join(f["test_name"] for f in ground_truth["failures"])
-        details = f"{details} | failing: {failed_names}"
+    fix_branch_failing = [f["test_name"] for f in ground_truth["failures"]]
+    all_passed = ground_truth["all_passed"]
+
+    if fix_branch_failing:
+        # Build the re-run candidates: fix-branch failures minus anything
+        # carve-out-protected, which is never even eligible to be checked
+        # against base -- see tester_mod.is_carveout_protected's docstring
+        # for why (a fresh regression test failing pre-fix, or the exact
+        # bug report's own named test failing on both branches, is the
+        # expected/correct signal, not noise).
+        candidates: dict[str, str] = {}
+        for f in ground_truth["failures"]:
+            name = f["test_name"]
+            if tester_mod.is_carveout_protected(name, description, handoff_new_tests):
+                continue
+            nodeid = f"{f['file']}::{name}" if f.get("file") else name
+            candidates[name] = nodeid
+
+        base_by_nodeid = await _rerun_failing_tests_against_base(
+            ctx, list(candidates.values())
+        )
+        base_by_name = {
+            name: base_by_nodeid.get(nodeid, False) for name, nodeid in candidates.items()
+        }
+
+        excluded, effective = tester_mod.classify_failures(
+            fix_branch_failing, base_by_name, description, handoff_new_tests
+        )
+        if excluded:
+            details = (
+                f"{details} | excluded as environmental noise "
+                f"(fails on base branch too): {excluded}"
+            )
+        if effective:
+            details = f"{details} | failing: {', '.join(effective)}"
+        # Ground truth said failed, but every failure that's still real
+        # signal after the carve-out-aware double-check is empty -- the
+        # suite is effectively green for this milestone's purposes.
+        all_passed = all_passed or not effective
 
     return TestReport(
         task_id=task_id,
-        all_passed=ground_truth["all_passed"],
+        all_passed=all_passed,
         details=details.strip(),
+        new_tests_added=handoff_new_tests,
+        regression_confirmed=regression_confirmed,
     )
+
+
+async def _rerun_failing_tests_against_base(ctx, nodeids: list[str]) -> dict[str, bool]:
+    """Re-run each of `nodeids` against sandbox.repo.BASE_BRANCH (the
+    pre-fix commit) and report whether it failed there too. Restores the
+    original branch (and any stashed changes) in a `finally`, regardless
+    of outcome -- this must never leave the sandbox checked out somewhere
+    other than where the rest of the chain expects it.
+
+    An inconclusive re-run (tool error, timeout) simply leaves that
+    nodeid out of the returned dict; classify_failures' fail-safe default
+    treats an absent entry as "not conclusively flaky", so a test never
+    gets silently excluded on an inconclusive result.
+    """
+    if not nodeids or ctx.sandbox is None:
+        return {}
+
+    sandbox = ctx.sandbox
+    original_branch = await asyncio.to_thread(git_repo.current_branch, sandbox)
+    stashed = await asyncio.to_thread(git_repo.stash_if_dirty, sandbox)
+    results: dict[str, bool] = {}
+    try:
+        await asyncio.to_thread(git_repo.checkout, sandbox, git_repo.BASE_BRANCH)
+        for nodeid in nodeids:
+            outcome = await invoke_tool(
+                "run_tests", {"path": nodeid}, ctx, agent_name="orchestrator"
+            )
+            results[nodeid] = bool(
+                outcome.success and outcome.output and outcome.output.get("failed", 0) > 0
+            )
+    finally:
+        await asyncio.to_thread(git_repo.checkout, sandbox, original_branch)
+        if stashed:
+            await asyncio.to_thread(git_repo.pop_stash, sandbox)
+    return results
 
 
 async def _run_reviewer(
@@ -891,6 +1035,32 @@ async def _run_tests_ground_truth(ctx) -> dict:
 async def _get_diff(ctx) -> str:
     result = await invoke_tool("get_diff", {}, ctx, agent_name="orchestrator")
     return result.output if result.success else ""
+
+
+async def _create_pull_request(
+    ctx,
+    report: RootCauseReport,
+    code_report: CodeChangeReport,
+    diff: str,
+    task_id: str,
+) -> ToolResult:
+    """Orchestrator-initiated, not model-initiated -- same pattern as
+    _get_diff/_run_tests_ground_truth. Title/body shape mirrors the old
+    Milestone 4/5 simulated-PR block (cli/main.py) that this milestone
+    replaces with a real API call."""
+    args = {
+        "title": f"fix: {report.root_cause[:72]}",
+        "body": (
+            f"Opened automatically by AMOP for task {task_id}.\n\n"
+            f"## Root cause\n{report.root_cause}\n\n"
+            f"## Fix plan\n{report.suggested_fix_plan}\n\n"
+            f"## Files changed\n{code_report.files_changed}\n\n"
+            f"## Diff\n```diff\n{diff}\n```\n"
+        ),
+        "head": code_report.branch,
+        "base": git_repo.BASE_BRANCH,
+    }
+    return await invoke_tool("create_pull_request", args, ctx, agent_name="orchestrator")
 
 
 # ---------------------------------------------------------------------

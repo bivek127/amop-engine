@@ -94,9 +94,25 @@ _CANCELLATION_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     if (state, TaskState.CANCELLED) not in _SPEC_TABLE_TRANSITIONS
 }
 
+# Milestone 6 (CLAUDE.md, spec Section 29.1): two system-initiated abort
+# edges that postdate Section 4.2's literal table, kept in their own dict
+# rather than folded into _SPEC_TABLE_TRANSITIONS so that dict's "verbatim"
+# claim about the spec's original table stays true.
+_MILESTONE_6_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
+    (TaskState.CODING, TaskState.NEEDS_HUMAN_INPUT): (
+        "diff exceeds coder.max_loc_per_task cap -- needs_decomposition "
+        "(Section 29.1)"
+    ),
+    (TaskState.PR_CREATION, TaskState.NEEDS_HUMAN_INPUT): (
+        "create_pull_request blocked or failed (secret detected, diff "
+        "too large, or GitHub API/push error) -- Section 12.5.1"
+    ),
+}
+
 TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     **_SPEC_TABLE_TRANSITIONS,
     **_CANCELLATION_TRANSITIONS,
+    **_MILESTONE_6_TRANSITIONS,
 }
 
 
