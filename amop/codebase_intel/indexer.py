@@ -24,11 +24,26 @@ import pathspec
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from amop.codebase_intel.chunker import chunk_source
+from amop.codebase_intel.chunker import Chunk, _estimate_tokens, chunk_source
 from amop.codebase_intel.embeddings import embed_texts
 from amop.database.models import CodeChunk
 
 _ALWAYS_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv"}
+
+# Milestone 8: chunker.py's own CHUNK_MAX_TOKENS=800 budget is only
+# enforced on classes (splitting an over-budget class into one chunk per
+# method) -- standalone functions, individual methods, and the "module"
+# leftover chunk have no further cap ("never a mid-function cut...
+# finest granularity available" per chunker.py's own docstring). A real
+# chunk can still come out huge: pyinvoke/invoke's Runner.run (a single
+# method) is 12,674 chars. Ollama's /api/embed silently truncates an
+# oversized individual item under its own default (truncate=true,
+# confirmed in its docs) -- but that's an implicit, undocumented-limit
+# provider default we don't want to be the only protection. This cap is
+# our own explicit, visible one: nomic-embed-text's 2048-token context
+# window via chunker.py's own len(text)//4 heuristic (2048*4=8192 chars),
+# with a small safety margin under it.
+MAX_CHUNK_CHARS_FOR_EMBEDDING = 8_000
 
 
 def _load_gitignore(source_dir: Path) -> pathspec.PathSpec | None:
@@ -53,6 +68,39 @@ def _walk_python_files(source_dir: Path) -> list[Path]:
             continue
         matches.append(path)
     return matches
+
+
+_TRUNCATION_MARKER = "\n# [AMOP: content truncated for embedding -- see indexer.py]"
+
+
+def _prepare_for_embedding(chunk: Chunk) -> str:
+    """The text actually sent to the embedding model for this chunk.
+    Truncated from the end (matching Ollama's own truncate=true default
+    direction) with a visible marker if it exceeds
+    MAX_CHUNK_CHARS_FOR_EMBEDDING -- a function's signature/docstring/
+    opening logic, usually at the start, is the most useful part to keep
+    for a semantic-search embedding.
+
+    This is ONLY ever used as embed_texts() input. The full, untruncated
+    chunk.content is still what gets stored in CodeChunk.content and
+    what search_code shows an agent -- a lower-fidelity embedding vector
+    for one chunk is an acceptable tradeoff; losing a real chunk from the
+    index or from what's shown to an agent is not.
+    """
+    content = chunk.content
+    if len(content) <= MAX_CHUNK_CHARS_FOR_EMBEDDING:
+        return content
+
+    warnings.warn(
+        f"chunk {chunk.file_path}::{chunk.symbol_name} ({chunk.symbol_type}) "
+        f"is {len(content)} chars (~{_estimate_tokens(content)} est. tokens), "
+        f"truncating to {MAX_CHUNK_CHARS_FOR_EMBEDDING} chars for embedding "
+        "-- the full chunk is still indexed and shown to agents unchanged, "
+        "only its embedding vector is based on the truncated text",
+        stacklevel=2,
+    )
+    cut = content[:MAX_CHUNK_CHARS_FOR_EMBEDDING]
+    return cut + _TRUNCATION_MARKER
 
 
 async def index_repo(
@@ -90,7 +138,7 @@ async def index_repo(
         await session.commit()
         return 0
 
-    embeddings = await embed_texts([c.content for c in all_chunks])
+    embeddings = await embed_texts([_prepare_for_embedding(c) for c in all_chunks])
 
     for chunk, embedding in zip(all_chunks, embeddings, strict=True):
         session.add(
