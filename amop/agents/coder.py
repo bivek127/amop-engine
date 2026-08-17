@@ -39,7 +39,7 @@ from amop.tools.registry import ToolContext
 
 class CoderAgent(BaseAgent):
     name = "coder"
-    tools = ("read_file", "write_file", "run_tests", "search_code")
+    tools = ("read_file", "write_file", "patch_file", "run_tests", "search_code")
     loop_limit = 10
 
     def __init__(
@@ -82,6 +82,30 @@ class CoderAgent(BaseAgent):
             "anything relevant, that is not a reason to give up -- fall "
             "back to read_file on any affected file paths you were "
             "given before concluding there's nothing to change.\n\n"
+            "If a plain read_file (no start_line/end_line) on a large "
+            "file comes back showing only its first ~60 lines with a "
+            "[NOTE: ...] at the top -- that is expected, not the whole "
+            "file and not an error. Don't conclude anything about the "
+            "rest of the file from what you were shown. Use search_code "
+            "to find the specific lines you actually need, then read_file "
+            "with start_line/end_line to see them.\n\n"
+            "To make an edit: prefer patch_file over write_file for any "
+            "EXISTING file -- it applies a unified diff to just the "
+            "lines you're changing, so you never need the whole file in "
+            "context, only the region you're editing plus a couple of "
+            "lines of surrounding context on each side. Locate that "
+            "region with search_code's returned line range, or a "
+            "targeted read_file(path, start_line, end_line) -- add "
+            "with_line_numbers=true on that read if you need to be sure "
+            "of the exact starting line for the diff's '@@' header (the "
+            "'N: ' prefix that adds is for your reference only -- never "
+            "put it in the actual diff body, that has to match the "
+            "file's real content exactly). Reserve write_file for a "
+            "brand new file, or a genuinely trivial single-line change. "
+            "If patch_file comes back PATCH_CONFLICT, the diff didn't "
+            "apply cleanly -- re-read the current region (it may have "
+            "changed) and retry with a fresh diff; never resubmit the "
+            "same one unchanged.\n\n"
             f"Available tools:\n{render_tool_catalog(self.tools)}\n\n"
             f"{RESPONSE_FORMAT_INSTRUCTIONS}"
         )

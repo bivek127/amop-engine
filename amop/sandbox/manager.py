@@ -131,6 +131,23 @@ class Sandbox:
                 raise FileNotFoundError(str(container_path))
             return extracted.read().decode("utf-8")
 
+    def stat_size(self, container_path: str) -> int:
+        """Byte count via `wc -c`, not a get_archive/tar-extract round
+        trip -- Milestone 11: read_file needs to decide whether a file
+        is too large to return whole *before* paying to fetch and
+        decode all of it, since for a genuinely huge file that content
+        would just get thrown away in favor of a scoped default anyway
+        (confirmed live: sending the full content with a warning notice
+        attached doesn't work -- the model's own context truncation
+        drops the notice's instruction along with everything else before
+        it ever gets a chance to act on it, so the fix has to be not
+        sending the whole thing in the first place, not asking nicely)."""
+        result = self._raw_exec(["wc", "-c", str(container_path)])
+        if result.exit_code != 0:
+            raise FileNotFoundError(str(container_path))
+        # "  12345 /workspace/path\n" -- first whitespace-separated token.
+        return int(result.stdout.split()[0])
+
     # -- command execution ---------------------------------------------
 
     def _raw_exec(self, argv: list[str]) -> ExecResult:

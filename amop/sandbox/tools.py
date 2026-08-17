@@ -52,6 +52,23 @@ def _container_path(target: Path, scratch_dir: Path) -> str:
 # take in whole" number.
 _LARGE_FILE_NOTICE_THRESHOLD = 8_000
 
+# Milestone 11: the notice above doesn't work above some size -- live-
+# confirmed against the real 65,509-char runners.py that the model never
+# acts on it; it just answers off whatever fits before Ollama's own
+# context truncation and stops there. Above this bar, don't even attempt
+# a whole-file return: the content would be silently cut down to
+# something unpredictable anyway, so cut it down to something small and
+# PREDICTABLE instead -- a fixed-size head slice the model can actually
+# reason about completely, with an explicit, unmissed-because-it's-the-
+# only-content instruction on how to see more. 24,000 chars sits in the
+# middle of a "reasonable, adjust if needed" 20-30KB band -- comfortably
+# above the notice threshold (files that merely trip the notice may
+# still mostly fit under some configs) and comfortably below the real
+# file that motivated this (65,509 chars), so it actually exercises the
+# new path rather than sitting right at the edge.
+_SCOPED_READ_THRESHOLD = 24_000
+_SCOPED_READ_DEFAULT_LINES = 60
+
 
 def _large_file_notice(content: str, total_lines: int) -> str:
     # Prepended, not appended: the same truncation this warns about
@@ -68,16 +85,38 @@ def _large_file_notice(content: str, total_lines: int) -> str:
     )
 
 
+def _scoped_default_notice(size_bytes: int, total_lines: int, shown_lines: int) -> str:
+    return (
+        f"[NOTE: this file is {size_bytes} bytes / {total_lines} lines -- "
+        f"too large to read in full, so only the first {shown_lines} lines "
+        "are shown below (line numbers included). This is not the whole "
+        "file. To see a different part: call read_file again with "
+        "start_line/end_line (add with_line_numbers=true if you're about "
+        "to construct a patch_file diff and need to know exact line "
+        "numbers) -- or use search_code first to find which lines are "
+        "actually relevant before reading them.]\n\n"
+    )
+
+
 @tool(
     name="read_file",
     description=(
         "Read the contents of a file inside the scratch workspace. "
         "Optional start_line/end_line (1-indexed, inclusive) read just "
-        "that slice instead of the whole file -- use this for a large "
-        "file once you have a rough idea where the relevant code is "
-        "(e.g. from search_code's line ranges), or as a follow-up after "
-        "a whole-file read that may have been too large to take in at "
-        "once."
+        "that slice instead of the whole file -- use this once you have "
+        "a rough idea where the relevant code is (e.g. from search_code's "
+        "line ranges). If you call this WITHOUT start_line/end_line on a "
+        "file that turns out to be large, you will automatically get back "
+        "only its first ~60 lines (not the whole thing, and not an error) "
+        "-- that's expected, re-call with start_line/end_line (using "
+        "search_code first, if you can, to know which lines you actually "
+        "need) to see the rest. Optional with_line_numbers=true prefixes "
+        "each returned line with 'N: ' -- useful when you're about to "
+        "construct a patch_file diff and need to know the exact starting "
+        "line for its '@@ -start,count +start,count @@' header. The "
+        "'N: ' prefix is for your reference only -- never include it in "
+        "an actual diff body, that has to match the file's real content "
+        "exactly."
     ),
     parameters={
         "type": "object",
@@ -85,6 +124,7 @@ def _large_file_notice(content: str, total_lines: int) -> str:
             "path": {"type": "string"},
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
+            "with_line_numbers": {"type": "boolean"},
         },
         "required": ["path"],
     },
@@ -96,6 +136,7 @@ async def read_file(
     ctx: ToolContext,
     start_line: int | None = None,
     end_line: int | None = None,
+    with_line_numbers: bool = False,
 ) -> ToolResult:
     target = resolve_within_scratch(path, ctx.scratch_dir)
     if target is None:
@@ -111,6 +152,38 @@ async def read_file(
             message="no sandbox session for this task",
         )
     container_path = _container_path(target, ctx.scratch_dir)
+
+    # Milestone 11: a size check BEFORE deciding to fetch/return the
+    # whole file, only when a whole-file read was actually requested --
+    # a targeted start_line/end_line call already knows what it wants
+    # and shouldn't be second-guessed here.
+    if start_line is None and end_line is None:
+        try:
+            size = await asyncio.to_thread(ctx.sandbox.stat_size, container_path)
+        except FileNotFoundError:
+            return ToolResult(
+                success=False, error_code="NOT_FOUND", message=f"No such file: {path}"
+            )
+        except Exception as exc:
+            return ToolResult(success=False, error_code="READ_ERROR", message=str(exc))
+
+        if size > _SCOPED_READ_THRESHOLD:
+            try:
+                content = await asyncio.to_thread(ctx.sandbox.read_file, container_path)
+            except FileNotFoundError:
+                return ToolResult(
+                    success=False, error_code="NOT_FOUND", message=f"No such file: {path}"
+                )
+            except Exception as exc:
+                return ToolResult(success=False, error_code="READ_ERROR", message=str(exc))
+
+            lines = content.splitlines(keepends=True)
+            total_lines = len(lines)
+            shown = lines[:_SCOPED_READ_DEFAULT_LINES]
+            numbered = "".join(f"{i + 1}: {line}" for i, line in enumerate(shown))
+            notice = _scoped_default_notice(size, total_lines, len(shown))
+            return ToolResult(success=True, output=notice + numbered)
+
     try:
         content = await asyncio.to_thread(ctx.sandbox.read_file, container_path)
     except FileNotFoundError:
@@ -131,10 +204,20 @@ async def read_file(
                 error_code="INVALID_ARGS",
                 message=f"start_line/end_line out of range for a {total}-line file",
             )
-        return ToolResult(success=True, output="".join(lines[lo - 1 : hi]))
+        selected = lines[lo - 1 : hi]
+        if with_line_numbers:
+            return ToolResult(
+                success=True,
+                output="".join(f"{lo + i}: {line}" for i, line in enumerate(selected)),
+            )
+        return ToolResult(success=True, output="".join(selected))
+
+    total_lines = content.count("\n") + 1
+    if with_line_numbers:
+        lines = content.splitlines(keepends=True)
+        content = "".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
 
     if len(content) > _LARGE_FILE_NOTICE_THRESHOLD:
-        total_lines = content.count("\n") + 1
         content = _large_file_notice(content, total_lines) + content
 
     return ToolResult(success=True, output=content)
@@ -177,6 +260,138 @@ async def write_file(path: str, content: str, ctx: ToolContext) -> ToolResult:
     except Exception as exc:
         return ToolResult(success=False, error_code="WRITE_ERROR", message=str(exc))
     return ToolResult(success=True, output=f"wrote {len(content)} bytes to {path}")
+
+
+def _normalize_diff_headers(diff: str, relative_path: str) -> str:
+    """Rewrite (or synthesize) the `--- `/`+++ ` header lines so the diff
+    unambiguously targets `relative_path`, regardless of what the model
+    wrote there -- paired with `git apply -p1` in patch_file(). This only
+    ever touches those two header lines, never the hunk bodies: the
+    actual patch application, and therefore all real conflict detection,
+    is still 100% git apply's job, not reimplemented here. Removes a
+    whole class of spurious failures (a local model getting a path
+    prefix wrong, or omitting headers entirely) that have nothing to do
+    with whether the diff's *content* is stale.
+    """
+    old_header = f"--- a/{relative_path}\n"
+    new_header = f"+++ b/{relative_path}\n"
+    lines = diff.splitlines(keepends=True)
+
+    has_old = any(line.startswith("--- ") for line in lines)
+    has_new = any(line.startswith("+++ ") for line in lines)
+
+    if not (has_old and has_new):
+        # No headers at all (or only one, a rare malformed case) --
+        # synthesize both fresh, in front of whatever hunk content is
+        # there. A genuinely malformed remainder still fails at git
+        # apply, cleanly, as PATCH_CONFLICT.
+        return old_header + new_header + diff
+
+    out = []
+    replaced_old = replaced_new = False
+    for line in lines:
+        if not replaced_old and line.startswith("--- "):
+            out.append(old_header)
+            replaced_old = True
+        elif not replaced_new and line.startswith("+++ "):
+            out.append(new_header)
+            replaced_new = True
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+@tool(
+    name="patch_file",
+    description=(
+        "Apply a unified diff to an EXISTING file inside the scratch "
+        "workspace -- preferred over write_file for edits to existing "
+        "files: smaller blast radius, and you don't need the whole file "
+        "in context to construct it, just the lines you're changing plus "
+        "a couple of lines of surrounding context on each side (so the "
+        "patch has something to anchor to). Standard unified diff format: "
+        "'--- '/'+++ ' header lines (the path in them is ignored -- only "
+        "the 'path' argument matters), then one or more hunks starting "
+        "'@@ -start,count +start,count @@', with context lines prefixed "
+        "by a space, removed lines by '-', added lines by '+'. Rejected "
+        "with error_code=PATCH_CONFLICT if the diff doesn't apply cleanly "
+        "(e.g. you read stale content, or got the location wrong) -- "
+        "re-read the current file/region first, then retry with a fresh "
+        "diff; never resubmit the same one unchanged. Use write_file "
+        "instead for a brand new file or a genuinely trivial single-line "
+        "change."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "diff": {"type": "string"},
+        },
+        "required": ["path", "diff"],
+    },
+    mutating=True,
+    timeout_seconds=10,
+)
+async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
+    target = resolve_within_scratch(path, ctx.scratch_dir)
+    if target is None:
+        return ToolResult(
+            success=False,
+            error_code="PATH_NOT_PERMITTED",
+            message=f"{path!r} is outside the scratch directory",
+        )
+    if ctx.sandbox is None:
+        return ToolResult(
+            success=False,
+            error_code="SANDBOX_UNAVAILABLE",
+            message="no sandbox session for this task",
+        )
+    container_path = _container_path(target, ctx.scratch_dir)
+    relative_path = container_path.removeprefix("/workspace/")
+
+    try:
+        await asyncio.to_thread(ctx.sandbox.read_file, container_path)
+    except FileNotFoundError:
+        return ToolResult(
+            success=False,
+            error_code="NOT_FOUND",
+            message=f"No such file: {path} -- use write_file to create a new file",
+        )
+    except Exception as exc:
+        return ToolResult(success=False, error_code="READ_ERROR", message=str(exc))
+
+    normalized = _normalize_diff_headers(diff, relative_path)
+    patch_path = f"/tmp/amop-patch-{uuid.uuid4().hex}.diff"
+    try:
+        await asyncio.to_thread(ctx.sandbox.write_file, patch_path, normalized)
+
+        check = await asyncio.to_thread(
+            ctx.sandbox.exec_run, f"git apply --check --recount {patch_path}"
+        )
+        if check.exit_code != 0:
+            return ToolResult(
+                success=False,
+                error_code="PATCH_CONFLICT",
+                message=(check.stderr or check.stdout or "diff did not apply cleanly").strip(),
+            )
+
+        applied = await asyncio.to_thread(
+            ctx.sandbox.exec_run, f"git apply --recount {patch_path}"
+        )
+        if applied.exit_code != 0:
+            return ToolResult(
+                success=False,
+                error_code="PATCH_CONFLICT",
+                message=(
+                    applied.stderr or applied.stdout or "diff did not apply cleanly"
+                ).strip(),
+            )
+    except Exception as exc:
+        return ToolResult(success=False, error_code="PATCH_ERROR", message=str(exc))
+    finally:
+        await asyncio.to_thread(ctx.sandbox.exec_run, f"rm -f {patch_path}")
+
+    return ToolResult(success=True, output=f"applied patch to {path}")
 
 
 # ---------------------------------------------------------------------
