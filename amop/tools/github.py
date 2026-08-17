@@ -2,11 +2,17 @@
 external side effect. This milestone (CLAUDE.md's "Real External Side
 Effects") makes AMOP touch a real GitHub repo for the first time.
 
-`SANDBOX_REPO` is hardcoded, not env-configurable, deliberately: no
-tool-argument path may ever point create_pull_request at a different
-repo, matching the milestone's explicit safety requirement -- "NEVER point
-any tool at any other GitHub repo, especially not this project's own repo
-(amop-engine), without the human explicitly saying so." `GITHUB_TOKEN` is
+`SANDBOX_REPO` has no tool-argument path to override it -- an agent can
+never choose the target repo, matching the milestone's explicit safety
+requirement: "NEVER point any tool at any other GitHub repo, especially
+not this project's own repo (amop-engine), without the human explicitly
+saying so." It IS operator-configurable via the `AMOP_GITHUB_REPO` env var
+(Milestone 7: real-repo validation runs need a different scratch target
+than `amop-sandbox`, and leaving this hardcoded would mean a successful
+run on a different repo's clone tries to push into `amop-sandbox` by
+mistake -- a real wrong-destination risk, not a hypothetical one). Default
+is unchanged from Milestone 6 unless a human explicitly sets the env var;
+no agent-controlled input reaches this value either way. `GITHUB_TOKEN` is
 read from the environment only (per Section 12.5: never hardcoded, never
 passed as a tool argument, never printed in full).
 
@@ -49,7 +55,7 @@ from amop.safety import scope_guard, secret_scan
 from amop.sandbox import repo as git_repo
 from amop.tools.registry import ToolContext, ToolResult, tool
 
-SANDBOX_REPO = "bivek127/amop-sandbox"
+SANDBOX_REPO = os.environ.get("AMOP_GITHUB_REPO", "bivek127/amop-sandbox")
 _SANDBOX_OWNER = SANDBOX_REPO.split("/")[0]
 
 
