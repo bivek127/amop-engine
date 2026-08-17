@@ -75,11 +75,23 @@ _TRUNCATION_MARKER = "\n# [AMOP: content truncated for embedding -- see indexer.
 
 def _prepare_for_embedding(chunk: Chunk) -> str:
     """The text actually sent to the embedding model for this chunk.
-    Truncated from the end (matching Ollama's own truncate=true default
-    direction) with a visible marker if it exceeds
-    MAX_CHUNK_CHARS_FOR_EMBEDDING -- a function's signature/docstring/
-    opening logic, usually at the start, is the most useful part to keep
-    for a semantic-search embedding.
+
+    Milestone 8 kept only the head (first MAX_CHUNK_CHARS_FOR_EMBEDDING
+    chars) on the theory that a function's signature/docstring/opening
+    logic is usually the most useful part to keep. Milestone 10's
+    real-repo diagnosis found a concrete counterexample: pyinvoke/
+    invoke's Runner.run (12,674 chars, one method, chunker.py never
+    splits below function granularity) has its actually-relevant line --
+    the hardcoded '/bin/bash' default -- at char offset 10,328, past the
+    old 8,000-char head-only cutoff. Its embedding never represented
+    that text, search_code's ranking never surfaced the file for a query
+    about it, and the Coder gave up without ever finding the right file.
+
+    Splitting the same char budget between head and tail catches both
+    "the interesting part is the setup" and "the interesting part is
+    deep in the body/return path" without exceeding the embedding
+    model's own context window (still the same total char budget as
+    before -- see MAX_CHUNK_CHARS_FOR_EMBEDDING's own reasoning).
 
     This is ONLY ever used as embed_texts() input. The full, untruncated
     chunk.content is still what gets stored in CodeChunk.content and
@@ -94,13 +106,15 @@ def _prepare_for_embedding(chunk: Chunk) -> str:
     warnings.warn(
         f"chunk {chunk.file_path}::{chunk.symbol_name} ({chunk.symbol_type}) "
         f"is {len(content)} chars (~{_estimate_tokens(content)} est. tokens), "
-        f"truncating to {MAX_CHUNK_CHARS_FOR_EMBEDDING} chars for embedding "
-        "-- the full chunk is still indexed and shown to agents unchanged, "
-        "only its embedding vector is based on the truncated text",
+        f"keeping {MAX_CHUNK_CHARS_FOR_EMBEDDING} chars (head+tail) for "
+        "embedding -- the full chunk is still indexed and shown to agents "
+        "unchanged, only its embedding vector is based on the reduced text",
         stacklevel=2,
     )
-    cut = content[:MAX_CHUNK_CHARS_FOR_EMBEDDING]
-    return cut + _TRUNCATION_MARKER
+    half = MAX_CHUNK_CHARS_FOR_EMBEDDING // 2
+    head = content[:half]
+    tail = content[-half:]
+    return f"{head}{_TRUNCATION_MARKER}{tail}"
 
 
 async def index_repo(

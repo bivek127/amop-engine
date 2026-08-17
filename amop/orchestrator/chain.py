@@ -804,10 +804,25 @@ def _investigator_prompt(description: str) -> str:
 async def _run_coder(
     agent, ctx, report: RootCauseReport, feedback: str, task_id: str, chain_result: ChainResult
 ) -> tuple[CodeChangeReport, str]:
+    # Milestone 10: when the Investigator already named affected files,
+    # tell the Coder to read them directly rather than re-discover them
+    # via search_code -- the real-repo diagnosis found the Coder
+    # re-searching from scratch, missing the file (a large-chunk
+    # embedding gap, see indexer.py's _prepare_for_embedding), and giving
+    # up despite already having a confident, specific answer in hand.
+    if report.affected_files:
+        files_line = (
+            "Affected files (from the investigation -- read these "
+            "directly with read_file first; only use search_code if you "
+            f"need more context beyond them): {report.affected_files}\n\n"
+        )
+    else:
+        files_line = ""
+
     prompt = (
         f"Root cause: {report.root_cause}\n"
-        f"Suggested fix plan: {report.suggested_fix_plan}\n"
-        f"Affected files: {report.affected_files}\n\n"
+        f"Suggested fix plan: {report.suggested_fix_plan}\n\n"
+        f"{files_line}"
         "Apply the smallest change that fixes this root cause. Fix the "
         "source code, not the tests. The repository is at /workspace."
     )

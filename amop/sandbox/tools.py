@@ -40,18 +40,63 @@ def _container_path(target: Path, scratch_dir: Path) -> str:
     return "/workspace" if str(relative) == "." else f"/workspace/{relative}"
 
 
+# Milestone 10: a whole-file read_file on a large real file (e.g.
+# pyinvoke/invoke's runners.py, 65,509 chars) silently overflows a
+# model's context window -- the model only ever "sees" the head of the
+# tool result and reasons about whatever's there, with no indication
+# anything was cut off (the same silent-truncation mechanism diagnosed
+# for chat completions generally, just showing up in a tool result
+# instead). Reusing indexer.py's MAX_CHUNK_CHARS_FOR_EMBEDDING threshold
+# here too -- not because it's an embedding budget, but because it's
+# already the project's one calibrated "this is too big for a model to
+# take in whole" number.
+_LARGE_FILE_NOTICE_THRESHOLD = 8_000
+
+
+def _large_file_notice(content: str, total_lines: int) -> str:
+    # Prepended, not appended: the same truncation this warns about
+    # drops the END of an oversized message, not the start (confirmed
+    # directly -- a 21,000-char single-message repro left Ollama's own
+    # prompt_eval_count covering only the first ~2,000 tokens). A notice
+    # placed after the content would just get cut off with it.
+    return (
+        f"[NOTE: this file is {len(content)} chars / {total_lines} lines -- "
+        "likely too large to fully fit in your context window at once. "
+        "If you don't find what you're looking for in what follows, "
+        "re-call read_file with start_line/end_line to read a specific "
+        "slice instead of assuming it isn't in the file.]\n\n"
+    )
+
+
 @tool(
     name="read_file",
-    description="Read the contents of a file inside the scratch workspace.",
+    description=(
+        "Read the contents of a file inside the scratch workspace. "
+        "Optional start_line/end_line (1-indexed, inclusive) read just "
+        "that slice instead of the whole file -- use this for a large "
+        "file once you have a rough idea where the relevant code is "
+        "(e.g. from search_code's line ranges), or as a follow-up after "
+        "a whole-file read that may have been too large to take in at "
+        "once."
+    ),
     parameters={
         "type": "object",
-        "properties": {"path": {"type": "string"}},
+        "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer"},
+            "end_line": {"type": "integer"},
+        },
         "required": ["path"],
     },
     mutating=False,
     timeout_seconds=5,
 )
-async def read_file(path: str, ctx: ToolContext) -> ToolResult:
+async def read_file(
+    path: str,
+    ctx: ToolContext,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> ToolResult:
     target = resolve_within_scratch(path, ctx.scratch_dir)
     if target is None:
         return ToolResult(
@@ -74,6 +119,24 @@ async def read_file(path: str, ctx: ToolContext) -> ToolResult:
         )
     except Exception as exc:
         return ToolResult(success=False, error_code="READ_ERROR", message=str(exc))
+
+    if start_line is not None or end_line is not None:
+        lines = content.splitlines(keepends=True)
+        total = len(lines)
+        lo = max(1, start_line or 1)
+        hi = min(total, end_line if end_line is not None else total)
+        if lo > total or lo > hi:
+            return ToolResult(
+                success=False,
+                error_code="INVALID_ARGS",
+                message=f"start_line/end_line out of range for a {total}-line file",
+            )
+        return ToolResult(success=True, output="".join(lines[lo - 1 : hi]))
+
+    if len(content) > _LARGE_FILE_NOTICE_THRESHOLD:
+        total_lines = content.count("\n") + 1
+        content = _large_file_notice(content, total_lines) + content
+
     return ToolResult(success=True, output=content)
 
 

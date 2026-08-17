@@ -136,11 +136,15 @@ def test_prepare_for_embedding_returns_unchanged_at_exact_cap():
 
 
 def test_prepare_for_embedding_truncates_and_warns_when_over_cap():
+    # Milestone 10: truncation now keeps head AND tail (not head-only --
+    # see the real Runner.run counterexample below), so the marker sits
+    # in the middle, not at the end.
     chunk = _chunk("z" * (MAX_CHUNK_CHARS_FOR_EMBEDDING + 1000), symbol_name="Runner.run")
-    with pytest.warns(UserWarning, match=r"x\.py::Runner\.run.*truncating"):
+    with pytest.warns(UserWarning, match=r"x\.py::Runner\.run.*chars"):
         result = _prepare_for_embedding(chunk)
     assert result.startswith("z" * 100)  # kept the start (signature/docstring end)
-    assert result.endswith(_TRUNCATION_MARKER)
+    assert result.endswith("z" * 100)  # Milestone 10: kept the end too
+    assert _TRUNCATION_MARKER in result
     assert len(result) == MAX_CHUNK_CHARS_FOR_EMBEDDING + len(_TRUNCATION_MARKER)
 
 
@@ -149,8 +153,39 @@ def test_prepare_for_embedding_never_shrinks_below_cap_length():
     # accidentally shorter from an off-by-one.
     chunk = _chunk("a" * 50_000)
     result = _prepare_for_embedding(chunk)
-    content_part = result[: -len(_TRUNCATION_MARKER)]
+    content_part = result.replace(_TRUNCATION_MARKER, "")
     assert len(content_part) == MAX_CHUNK_CHARS_FOR_EMBEDDING
+
+
+def test_prepare_for_embedding_keeps_tail_content_past_old_head_only_cutoff():
+    """Milestone 10's actual root cause, reproduced as a regression
+    guard: real content near the END of an oversized chunk -- which
+    Milestone 8's head-only truncation would have thrown away entirely
+    -- must still survive into the embedded text. This is exactly what
+    caused search_code to miss pyinvoke/invoke's Runner.run for a query
+    about its hardcoded '/bin/bash' default: that line sits at char
+    10,328 of a 12,674-char chunk, past the old 8,000-char head-only
+    cutoff, so its embedding never represented it and semantic search
+    never surfaced the file."""
+    head_filler = "a" * (MAX_CHUNK_CHARS_FOR_EMBEDDING - 10)
+    tail_marker = "IMPORTANT_TAIL_CONTENT_bin_bash_default_here"
+    chunk = _chunk(head_filler + "b" * 2000 + tail_marker, symbol_name="Runner.run")
+
+    with pytest.warns(UserWarning):
+        result = _prepare_for_embedding(chunk)
+
+    assert tail_marker in result
+
+
+def test_prepare_for_embedding_still_keeps_head_content_too():
+    # Guards the other direction -- Milestone 10's fix must not regress
+    # Milestone 8's original case (signature/docstring near the start).
+    head_marker = "IMPORTANT_HEAD_CONTENT_signature_here"
+    chunk = _chunk(head_marker + "z" * (MAX_CHUNK_CHARS_FOR_EMBEDDING * 2))
+
+    result = _prepare_for_embedding(chunk)
+
+    assert head_marker in result
 
 
 # ---------------------------------------------------------------------
