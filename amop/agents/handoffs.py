@@ -17,6 +17,7 @@ This is the project's core rule ("software decides what's allowed")
 applied to handoffs, and it's marked field-by-field below.
 """
 
+import uuid
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -29,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 CONFIDENCE_THRESHOLD = 0.6
 
 _MAX_EXCERPT_CHARS = 200
+_MAX_ANOMALY_SUMMARY_CHARS = 280
 
 
 class Evidence(BaseModel):
@@ -199,3 +201,95 @@ class ReviewVerdict(BaseModel):
             "act on that the tests haven't already settled."
         ),
     )
+
+
+class AnomalyEvidence(BaseModel):
+    """One piece of evidence backing an AnomalyAlert (6.1)."""
+
+    type: Literal["log_line", "metric_point", "event"]
+    ref: str
+
+
+class AnomalyAlert(BaseModel):
+    """Watcher's handoff (6.1). Watcher's job is to flag, not diagnose --
+    "Not responsible for diagnosing anything -- it flags, it doesn't
+    explain" -- so this schema is deliberately thin compared to
+    RootCauseReport.
+
+    Ground truth vs. model judgment, this milestone's GitHub-issues-only
+    scope: `anomaly_id` is orchestrator-generated (a fresh uuid4, never
+    asked of the model -- same reasoning as _retag() in chain.py stamping
+    task_id itself). `source` is always "github" this milestone (the
+    other two literal values are spec'd for future log/metric sources,
+    Section 6.1's full tool list -- not built here, CLAUDE.md's Milestone
+    9 scope explicitly narrows to GitHub issues only).
+    `detection_method` is always "threshold" -- statistical/ml detection
+    are spec'd (6.1) but explicitly post-MVP, gated behind a config flag
+    that defaults off. `severity`, `summary`, and `confidence` ARE
+    genuine model judgment: given a batch of issue titles/bodies, Watcher
+    decides which look like substantive bug reports worth flagging (not,
+    say, a documentation typo or a question) and how severe each looks --
+    real work, matching its spec'd "low reasoning, pattern-match" model
+    tier, even though it never calls a tool itself (see agents/watcher.py
+    and orchestrator/watch.py for why -- loop_limit=1 means one model
+    turn, so the issue list is pre-fetched by the orchestrator, not
+    fetched by Watcher mid-loop).
+
+    `repo`/`github_issue_number` are Milestone 9 additions, not in spec
+    6.1's literal schema -- orchestrator/watch.py's dedup (layer 1a,
+    exact match) and safety/circuit_breakers.py's failure_streak_breaker
+    (scoped to (repo, github_issue_number), not repo alone) both need
+    something concrete to key on, and there's no `incidents` table this
+    milestone to hold it instead. Deliberately NOT trusted from the
+    model: asking Watcher to correctly echo back an exact GitHub issue
+    number it saw in a prompt is unnecessary risk for zero benefit, the
+    same "don't trust a self-report for something mechanically knowable"
+    rule as CodeChangeReport.branch/commit_sha. Both default to
+    placeholder values here and are always overwritten by the
+    orchestrator via .model_copy(update=...) after validation, using
+    `issue_index` (which the model DOES fill -- a small 1-based position
+    in the numbered batch it was shown, a much smaller/safer thing to get
+    right than an arbitrary real issue number) to look the real values up
+    from the orchestrator's own pre-fetched, ground-truth issue list.
+    """
+
+    anomaly_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    source: Literal["logs", "metrics", "github"] = "github"
+    severity: Literal["low", "medium", "high", "critical"]
+    summary: str
+    evidence: list[AnomalyEvidence] = Field(default_factory=list)
+    detection_method: Literal["threshold", "statistical", "ml"] = "threshold"
+    confidence: float = Field(ge=0.0, le=1.0)
+    issue_index: int = Field(
+        description=(
+            "The 1-based position of the issue this alert is about, "
+            "within the numbered batch you were given -- e.g. 3 for "
+            "the issue labeled 'Issue 3' in the prompt. Not the "
+            "issue's real GitHub number."
+        )
+    )
+    repo: str = ""
+    github_issue_number: int = 0
+
+    @field_validator("summary")
+    @classmethod
+    def _truncate_summary(cls, value: str) -> str:
+        # Same reasoning as Evidence.excerpt above: truncate, don't
+        # reject -- an over-long summary is a verbose model, not a
+        # failed handoff.
+        if len(value) <= _MAX_ANOMALY_SUMMARY_CHARS:
+            return value
+        return value[: _MAX_ANOMALY_SUMMARY_CHARS - 1] + "…"
+
+
+class WatcherReport(BaseModel):
+    """Wraps AnomalyAlert in a batch, because Watcher classifies a whole
+    poll-cycle's worth of issues in its ONE model turn (loop_limit=1,
+    Section 6.1: "Watcher makes one classification pass per poll cycle;
+    it does not investigate") -- final_answer can only appear once per
+    run() call (agents/base.py), so a raw list isn't a valid handoff
+    schema on its own; alerts=[] is a legitimate, common result (nothing
+    in this batch looked like a real anomaly), not an error.
+    """
+
+    alerts: list[AnomalyAlert] = Field(default_factory=list)

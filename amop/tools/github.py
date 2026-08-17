@@ -186,6 +186,70 @@ async def create_pull_request(
 
 
 @tool(
+    name="list_open_issues",
+    description=(
+        "List open issues (not pull requests) on a GitHub repo, most "
+        "recently created first. Read-only."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"repo": {"type": "string"}},
+        "required": ["repo"],
+    },
+    mutating=False,
+    timeout_seconds=30,
+)
+async def list_open_issues(repo: str, ctx: ToolContext) -> ToolResult:
+    """Milestone 9: the first tool in this file to take a `repo` argument
+    instead of the hardcoded SANDBOX_REPO -- deliberate, not an oversight.
+    Every other tool here hardcodes its target because it's MUTATING (PR
+    creation, pushing a branch) and "an agent can never choose the target
+    repo" is a real safety property for those. This tool is read-only --
+    listing issues has no destination to get wrong -- and Watcher's whole
+    purpose is polling a human-configured `--repo` (cli/main.py's `watch`
+    command), which is orchestrator-supplied at the CLI layer, never
+    model-chosen (see agents/watcher.py: Watcher never calls this tool
+    itself, the orchestrator pre-fetches and hands it results as data).
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return ToolResult(
+            success=False,
+            error_code="GITHUB_AUTH_MISSING",
+            message="GITHUB_TOKEN is not set",
+        )
+
+    client = _client(token)
+    try:
+        gh_repo = await asyncio.to_thread(client.get_repo, repo)
+        issues = await asyncio.to_thread(
+            lambda: list(gh_repo.get_issues(state="open", sort="created", direction="desc"))
+        )
+        # PyGithub's get_issues() returns pull requests too (a real
+        # GitHub API quirk: PRs are a superset of issues) -- filter them
+        # out, never guarded against anywhere else in this file since no
+        # tool has listed issues before.
+        open_issues = [i for i in issues if i.pull_request is None]
+        output = [
+            {
+                "number": i.number,
+                "title": i.title,
+                "body": i.body or "",
+                "created_at": i.created_at.isoformat() if i.created_at else None,
+                "html_url": i.html_url,
+            }
+            for i in open_issues
+        ]
+        return ToolResult(success=True, output=output)
+    except GithubException as exc:
+        return ToolResult(
+            success=False,
+            error_code="GITHUB_API_ERROR",
+            message=_mask_token_in_text(str(exc), token),
+        )
+
+
+@tool(
     name="get_ci_status",
     description="Best-effort combined CI status for an open pull request's head commit.",
     parameters={

@@ -419,8 +419,24 @@ async def run_chain(
         emit(message)
 
     try:
-        await go(TaskState.TRIAGING, actor="system")
-        stage("TRIAGING: bug report accepted, treating as novel")
+        # Milestone 9: a Watcher-created task is already put into TRIAGING
+        # by orchestrator/watch.py's triage_anomaly() before run_chain()
+        # is ever called (it has to be, to legally reach
+        # MERGED_INTO_EXISTING/CANCELLED, both only reachable FROM
+        # TRIAGING -- see state_machine.py's TRANSITIONS). There is no
+        # (TRIAGING, TRIAGING) self-transition, so calling go(TRIAGING)
+        # unconditionally here would raise IllegalTransitionError for
+        # every Watcher-sourced task. A CLI-driven `amop fix` task is
+        # still CREATED at this point exactly as before, so this is
+        # additive, not a behavior change for the existing path.
+        if TaskState(task.state) is TaskState.CREATED:
+            await go(TaskState.TRIAGING, actor="system")
+            stage("TRIAGING: bug report accepted, treating as novel")
+        else:
+            stage(
+                f"TRIAGING: already triaged by caller (state={task.state}) -- "
+                "dedup/severity checked upstream"
+            )
         await go(TaskState.INVESTIGATING, actor="system")
 
         # -- INVESTIGATING -------------------------------------------

@@ -109,10 +109,25 @@ _MILESTONE_6_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     ),
 }
 
+# Milestone 9 (CLAUDE.md, spec Section 12.3): failure_streak_breaker's
+# trip action is explicit in the spec's own breaker table -- "routed to
+# NEEDS_HUMAN_INPUT with reason repeated_failure... deliberately
+# independent of cost" -- but TRIAGING has no edge to NEEDS_HUMAN_INPUT
+# in Section 4.2's original table (that table predates circuit breakers
+# entirely). Same pattern as _MILESTONE_6_TRANSITIONS: a new,
+# system-initiated abort edge, kept in its own dict rather than folded
+# into _SPEC_TABLE_TRANSITIONS.
+_MILESTONE_9_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
+    (TaskState.TRIAGING, TaskState.NEEDS_HUMAN_INPUT): (
+        "failure_streak_breaker tripped -- repeated_failure (Section 12.3)"
+    ),
+}
+
 TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     **_SPEC_TABLE_TRANSITIONS,
     **_CANCELLATION_TRANSITIONS,
     **_MILESTONE_6_TRANSITIONS,
+    **_MILESTONE_9_TRANSITIONS,
 }
 
 
