@@ -293,3 +293,54 @@ class WatcherReport(BaseModel):
     """
 
     alerts: list[AnomalyAlert] = Field(default_factory=list)
+
+
+class ReportSummary(BaseModel):
+    """Reporter's handoff (6.8). Summarization only -- Reporter "never
+    touches code or opens PRs", which agents/reporter.py enforces
+    structurally by giving it no tools at all rather than by asking it
+    nicely in a prompt.
+
+    Ground truth vs. model judgment, and this one is unusually stark:
+    EVERY numeric field here is overwritten by the orchestrator after
+    validation via .model_copy(update=...), from real SQL over `tasks`
+    and `task_transitions`. The model is shown the counts and asked to
+    echo them, but its echo is never what gets reported -- exactly the
+    same treatment TestReport.all_passed gets in chain.py ("A model may
+    describe the failures; it may not decide whether there were any").
+    A report whose numbers came from a model's arithmetic over a prompt
+    is worse than no report, because it looks equally authoritative
+    while being unfalsifiable.
+
+    `top_issues` is the one genuinely model-authored field: given the
+    window's real task list, which themes actually mattered. That's
+    editorial judgment over data it can see, which is what a summarizer
+    is for.
+
+    Deviation from 6.8's stated inputs, recorded rather than glossed:
+    the spec sources this from `agent_actions` + `tasks`, but there is
+    no agent_actions table in this codebase (Section 14.2 defines one;
+    no milestone has built it). `task_transitions` -- the append-only
+    state-change audit trail from Milestone 1 -- carries enough to
+    compute every field below, so that's the source. `prs_merged` is
+    consequently always 0: nothing in this codebase can reach MERGED yet
+    (there is no auto-merge and no post-merge detection), so reporting
+    anything else would be fabrication.
+    """
+
+    period_start: str
+    period_end: str
+    tasks_resolved: int = 0
+    prs_opened: int = 0
+    prs_merged: int = 0
+    dependencies_updated: int = 0
+    top_issues: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Short prose bullets naming the themes that actually "
+            "mattered in this window -- recurring failures, notable "
+            "fixes, anything a human should look at. Your own judgment "
+            "over the task list you were shown; do not invent tasks "
+            "that are not in it."
+        ),
+    )

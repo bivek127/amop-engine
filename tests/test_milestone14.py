@@ -18,18 +18,25 @@ Requires: Postgres at TEST_DATABASE_URL.
 """
 
 import hashlib
+import json
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
 
+from amop.agents.handoffs import ReportSummary
+from amop.agents.reporter import ReporterAgent
 from amop.database.models import EMBEDDING_DIM, MemoryItem, Task
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
+from amop.models.base import BaseLLM, ModelResponse
+from amop.orchestrator import reporting
 from amop.orchestrator.chain import MEMORY_WRITE_STATES, ChainResult
+from amop.orchestrator.reporting import ReportWindow
 from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
 
 TEST_DATABASE_URL = "postgresql+asyncpg://localhost/amop_test"
@@ -458,3 +465,194 @@ async def test_retrieve_relevant_memory_skips_a_disputed_incident(session):
     )
     assert after == 0
     assert rendered == ""
+
+
+# ---------------------------------------------------------------------
+# Stage 3 — Reporter (Section 6.8)
+# ---------------------------------------------------------------------
+
+
+class ScriptedLLM(BaseLLM):
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+        self.prompts: list[list[dict]] = []
+
+    async def complete(self, messages, tools=None) -> ModelResponse:
+        self.prompts.append(list(messages))
+        content = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        return ModelResponse(content=content, model="scripted")
+
+    async def embed(self, texts):
+        raise NotImplementedError
+
+
+def _final(answer) -> str:
+    return json.dumps({"final_answer": answer})
+
+
+def test_reporter_has_no_tools_and_so_cannot_touch_code():
+    """Section 6.8's "never touches code or opens PRs" is enforced
+    structurally, not by prompt text -- and NOT with an empty tuple,
+    which base.py's `self.tools or None` would turn into "unrestricted"."""
+    assert ReporterAgent.tools == ("__none__",)
+    assert ReporterAgent.tools != ()
+    assert ReporterAgent.handoff_schema is ReportSummary
+    assert ReporterAgent.loop_limit == 3
+
+
+async def test_reporter_cannot_call_a_mutating_tool_even_if_it_tries(tmp_path):
+    """The allowlist, exercised rather than asserted: a Reporter that
+    emits a write_file tool_call gets TOOL_NOT_PERMITTED."""
+    from amop.tools.registry import ToolContext, invoke_tool
+
+    ctx = ToolContext(agent_name="reporter", scratch_dir=tmp_path, mode="observer")
+    result = await invoke_tool(
+        "write_file",
+        {"path": "x.py", "content": "nope"},
+        ctx,
+        agent_name="reporter",
+        allowed_tools=ReporterAgent.tools,
+    )
+
+    assert not result.success
+    assert result.error_code == "TOOL_NOT_PERMITTED"
+
+
+def test_enforce_verified_counts_overrides_whatever_the_model_claimed():
+    """The load-bearing guarantee: a model may describe the window, it
+    may not decide the counts."""
+    window = ReportWindow(
+        period_start=datetime(2026, 1, 1, tzinfo=UTC),
+        period_end=datetime(2026, 1, 8, tzinfo=UTC),
+        tasks_resolved=3,
+        prs_opened=2,
+        prs_merged=0,
+        dependencies_updated=1,
+    )
+    # A model inflating every number, and inventing a different window.
+    lying = ReportSummary(
+        period_start="1999-01-01",
+        period_end="1999-12-31",
+        tasks_resolved=999,
+        prs_opened=888,
+        prs_merged=777,
+        dependencies_updated=666,
+        top_issues=["the flaky auth test keeps failing"],
+    )
+
+    corrected = reporting.enforce_verified_counts(lying, window)
+
+    assert corrected.tasks_resolved == 3
+    assert corrected.prs_opened == 2
+    assert corrected.prs_merged == 0
+    assert corrected.dependencies_updated == 1
+    assert corrected.period_start == window.period_start.isoformat()
+    assert corrected.period_end == window.period_end.isoformat()
+    # ...but its actual judgment is preserved untouched.
+    assert corrected.top_issues == ["the flaky auth test keeps failing"]
+
+
+async def test_collect_report_window_counts_real_transitions(session):
+    """Counts come from transitions INTO a state during the window, not
+    from where tasks happen to sit now."""
+    from amop.orchestrator.task import create_task, transition
+
+    task = await create_task(
+        session, task_type="bug_fix", task_context={"prompt": "widget is broken"}
+    )
+    await transition(session, task, TaskState.TRIAGING)
+    await transition(session, task, TaskState.INVESTIGATING)
+    await transition(session, task, TaskState.NEEDS_HUMAN_INPUT)
+
+    start = datetime(2000, 1, 1, tzinfo=UTC)
+    end = datetime(2100, 1, 1, tzinfo=UTC)
+    window = await reporting.collect_report_window(session, start, end)
+
+    assert window.tasks_created == 1
+    assert window.tasks_resolved == 1  # NEEDS_HUMAN_INPUT is terminal
+    assert window.prs_opened == 0
+    assert window.prs_merged == 0
+    assert len(window.digests) == 1
+    assert window.digests[0].prompt == "widget is broken"
+
+
+async def test_collect_report_window_excludes_activity_outside_the_window(session):
+    from amop.orchestrator.task import create_task, transition
+
+    task = await create_task(
+        session, task_type="bug_fix", task_context={"prompt": "old news"}
+    )
+    await transition(session, task, TaskState.TRIAGING)
+    await transition(session, task, TaskState.CANCELLED)
+
+    # A window that ended before any of that happened.
+    window = await reporting.collect_report_window(
+        session,
+        datetime(2000, 1, 1, tzinfo=UTC),
+        datetime(2000, 1, 2, tzinfo=UTC),
+    )
+
+    assert window.tasks_created == 0
+    assert window.tasks_resolved == 0
+    assert window.digests == []
+
+
+async def test_run_report_returns_db_counts_not_model_counts(session):
+    """End to end with a scripted model that lies about every number."""
+    from amop.orchestrator.task import create_task, transition
+
+    task = await create_task(
+        session, task_type="bug_fix", task_context={"prompt": "login 500s"}
+    )
+    await transition(session, task, TaskState.TRIAGING)
+    await transition(session, task, TaskState.CANCELLED)
+
+    llm = ScriptedLLM(
+        [
+            _final(
+                {
+                    "period_start": "1999-01-01",
+                    "period_end": "1999-12-31",
+                    "tasks_resolved": 12345,
+                    "prs_opened": 999,
+                    "prs_merged": 42,
+                    "dependencies_updated": 7,
+                    "top_issues": ["login endpoint returned 500s"],
+                }
+            )
+        ]
+    )
+
+    summary, window = await reporting.run_report(
+        session,
+        start=datetime(2000, 1, 1, tzinfo=UTC),
+        end=datetime(2100, 1, 1, tzinfo=UTC),
+        model=llm,
+    )
+
+    assert summary.tasks_resolved == window.tasks_resolved == 1
+    assert summary.prs_opened == 0
+    assert summary.prs_merged == 0
+    assert summary.dependencies_updated == 0
+    assert summary.top_issues == ["login endpoint returned 500s"]
+
+    # And the model really was shown the true numbers to begin with.
+    prompt_text = llm.prompts[0][-1]["content"]
+    assert "tasks reaching a terminal state : 1" in prompt_text
+    assert "login 500s" in prompt_text
+
+
+async def test_run_report_counts_dependency_updates_by_task_type(session):
+    from amop.orchestrator.task import create_task
+
+    await create_task(session, task_type="dependency_update", task_context={})
+    await create_task(session, task_type="bug_fix", task_context={})
+
+    window = await reporting.collect_report_window(
+        session, datetime(2000, 1, 1, tzinfo=UTC), datetime(2100, 1, 1, tzinfo=UTC)
+    )
+
+    assert window.tasks_created == 2
+    assert window.dependencies_updated == 1

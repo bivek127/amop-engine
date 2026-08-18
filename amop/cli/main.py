@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -14,6 +15,7 @@ from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
 from amop.orchestrator.chain import run_fix
+from amop.orchestrator.reporting import run_report
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
 from amop.orchestrator.watch import find_existing_task_for_issue, triage_anomaly
@@ -429,6 +431,82 @@ async def _status(task_id: uuid.UUID) -> None:
             f"  [{t.timestamp}] {t.from_state or '(none)'} -> {t.to_state}"
             f"  trigger={t.trigger!r} actor={t.actor!r}"
         )
+
+
+@app.command()
+@click.option(
+    "--since",
+    required=True,
+    help="Start of the reporting window (YYYY-MM-DD, or an ISO timestamp).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="End of the window (YYYY-MM-DD or ISO). Defaults to now.",
+)
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+def report(since: str, until: str | None, model: str) -> None:
+    """Summarize a window of activity (Section 6.8)."""
+    try:
+        start = _parse_window_bound(since)
+        end = _parse_window_bound(until) if until else datetime.now(UTC)
+    except ValueError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+    if start > end:
+        click.echo("--since must be before --until", err=True)
+        sys.exit(1)
+    asyncio.run(_report(start, end, model))
+
+
+def _parse_window_bound(value: str) -> datetime:
+    """Accept a plain date or a full ISO timestamp, always timezone-aware.
+
+    A naive datetime compared against timezone-aware DB columns raises at
+    query time rather than returning a wrong answer -- but it raises deep
+    inside asyncpg, so it's normalized here where the error can name the
+    actual problem.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"Not a valid date/time: {value!r} -- use YYYY-MM-DD or an ISO timestamp"
+        ) from None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+async def _report(start: datetime, end: datetime, model: str) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    try:
+        async with session_factory() as session:
+            provider = OllamaProvider(model=model)
+            summary, window = await run_report(
+                session, start=start, end=end, model=provider
+            )
+    finally:
+        await engine.dispose()
+
+    click.echo(f"Report for {summary.period_start} .. {summary.period_end}")
+    click.echo()
+    click.echo("Verified counts (from the database, not the model):")
+    click.echo(f"  tasks reaching a terminal state : {summary.tasks_resolved}")
+    click.echo(f"  pull requests opened            : {summary.prs_opened}")
+    click.echo(f"  pull requests merged            : {summary.prs_merged}")
+    click.echo(f"  dependency updates              : {summary.dependencies_updated}")
+    click.echo(f"  (tasks created in window        : {window.tasks_created})")
+    click.echo(f"  (of the terminal ones, failed   : {window.tasks_failed})")
+    click.echo()
+    click.echo("Top issues (Reporter's summary):")
+    if not summary.top_issues:
+        click.echo("  (none reported)")
+    for issue in summary.top_issues:
+        click.echo(f"  - {issue}")
 
 
 @app.group()
