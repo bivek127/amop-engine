@@ -197,6 +197,21 @@ def render_window_for_prompt(window: ReportWindow) -> str:
     return "\n".join(lines)
 
 
+# Filler a summarizer emits when it pads a list to look complete. Seen
+# live in Checkpoint 3: asked for the notable themes in a window, the
+# model produced three real ones and then "N/A" as a fourth. The prompt
+# already says not to pad; this drops the padding when it happens anyway,
+# because a prompt is a request and this is a guarantee.
+_FILLER_ISSUES = frozenset(
+    {"n/a", "na", "none", "none.", "nothing", "nothing notable", "-", "--", ""}
+)
+
+
+def drop_filler_issues(issues: list[str]) -> list[str]:
+    """Remove padding entries, preserving order and real content."""
+    return [i for i in issues if i.strip().strip(".").lower() not in _FILLER_ISSUES]
+
+
 def enforce_verified_counts(
     summary: ReportSummary, window: ReportWindow
 ) -> ReportSummary:
@@ -218,6 +233,7 @@ def enforce_verified_counts(
             "prs_opened": window.prs_opened,
             "prs_merged": window.prs_merged,
             "dependencies_updated": window.dependencies_updated,
+            "top_issues": drop_filler_issues(summary.top_issues),
         }
     )
 

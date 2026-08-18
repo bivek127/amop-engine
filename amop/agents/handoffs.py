@@ -295,6 +295,41 @@ class WatcherReport(BaseModel):
     alerts: list[AnomalyAlert] = Field(default_factory=list)
 
 
+class OptimizationReport(BaseModel):
+    """Optimizer's handoff (6.6).
+
+    Ground truth vs. model judgment, and here the split is the whole
+    safety story: `baseline_ms`, `optimized_ms`, `improvement_pct` and
+    `status` are ALL overwritten by the orchestrator from real
+    before/after benchmark runs. A model asked whether its own
+    optimization helped will say yes -- that is not a knock on any
+    particular model, it is that "did this get faster" is a measurement,
+    and measurements are not opinions. Section 6.6 hangs a real action
+    on that number (below threshold, the change is reverted), so it has
+    to come from a timer.
+
+    `technique` is genuinely the model's: a short description of what it
+    actually did, which is the part a human reviewer most wants and no
+    benchmark can supply.
+    """
+
+    task_id: str
+    status: Literal["improved", "no_improvement"] = "no_improvement"
+    baseline_ms: float = 0.0
+    optimized_ms: float = 0.0
+    improvement_pct: float = 0.0
+    technique: str = Field(
+        default="",
+        description=(
+            "One or two sentences: what you changed and why it should be "
+            "faster. Describe the actual change, not the goal."
+        ),
+    )
+    files_changed: list[str] = Field(default_factory=list)
+    reverted: bool = False
+    diagnostic: str | None = None
+
+
 class DependencyUpdateReport(BaseModel):
     """Dependency Updater's handoff (6.7).
 

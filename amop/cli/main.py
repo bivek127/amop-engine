@@ -16,6 +16,7 @@ from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
 from amop.orchestrator.chain import run_fix
 from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
+from amop.orchestrator.optimize import MIN_IMPROVEMENT_PCT, run_optimization
 from amop.orchestrator.reporting import run_report
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
@@ -432,6 +433,93 @@ async def _status(task_id: uuid.UUID) -> None:
             f"  [{t.timestamp}] {t.from_state or '(none)'} -> {t.to_state}"
             f"  trigger={t.trigger!r} actor={t.actor!r}"
         )
+
+
+@app.command()
+@click.option(
+    "--repo",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Path to the repository to optimize.",
+)
+@click.option(
+    "--entry-point",
+    default="benchmark.py",
+    show_default=True,
+    help="Benchmark entry point (a script with a __main__ block).",
+)
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+@click.option(
+    "--min-improvement",
+    default=MIN_IMPROVEMENT_PCT,
+    show_default=True,
+    help="Percent improvement required to keep the change (Section 6.6).",
+)
+def optimize(repo: str, entry_point: str, model: str, min_improvement: float) -> None:
+    """Profile, optimize, and measure -- reverting a marginal change (6.6)."""
+    asyncio.run(_optimize(repo, entry_point, model, min_improvement))
+
+
+async def _optimize(
+    repo: str, entry_point: str, model: str, min_improvement: float
+) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        task = await create_task(
+            session,
+            task_type="optimization",
+            task_context={"repo": repo, "entry_point": entry_point},
+        )
+        click.echo(f"Task {task.id}")
+
+        result = await run_optimization(
+            session,
+            task,
+            repo_path=Path(repo),
+            model=OllamaProvider(model=model),
+            entry_point=entry_point,
+            min_improvement_pct=min_improvement,
+            emit=lambda message: click.echo(f"  {message}"),
+        )
+
+    await engine.dispose()
+
+    report = result.report
+    click.echo()
+    click.echo("Optimization report (timings measured, not self-reported):")
+    click.echo(f"  status         : {report.status}")
+    click.echo(f"  baseline       : {report.baseline_ms:.1f} ms")
+    click.echo(f"  optimized      : {report.optimized_ms:.1f} ms")
+    click.echo(f"  improvement    : {report.improvement_pct:+.1f}%")
+    click.echo(f"  technique      : {report.technique or '(none reported)'}")
+    click.echo(f"  files changed  : {report.files_changed or '[]'}")
+    click.echo(f"  reverted       : {report.reverted}")
+    if report.diagnostic:
+        click.echo(f"  diagnostic     : {report.diagnostic}")
+
+    # Same visibility every other command gives: whether the agent
+    # actually profiled before hypothesizing (6.6's hard requirement) is
+    # only checkable if the tool calls are shown.
+    click.echo()
+    if result.tool_calls:
+        click.echo("Tool calls:")
+        for tc in result.tool_calls:
+            status_word = "ALLOWED" if tc["success"] else f"FAILED: {tc['error_code']}"
+            click.echo(f"  {tc['name']} -> {status_word}")
+    else:
+        click.echo("Tool calls: (none)")
+    if result.diff:
+        click.echo()
+        click.echo("Diff:")
+        click.echo(result.diff)
+
+    if report.status != "improved":
+        sys.exit(2)
 
 
 @app.command("update-deps")

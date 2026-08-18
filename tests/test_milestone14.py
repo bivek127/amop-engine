@@ -30,18 +30,19 @@ from sqlalchemy import select, text
 
 from amop.agents.dependency_updater import DependencyUpdaterAgent
 from amop.agents.handoffs import DependencyUpdateReport, ReportSummary
+from amop.agents.optimizer import OptimizerAgent
 from amop.agents.reporter import ReporterAgent
 from amop.database.models import EMBEDDING_DIM, MemoryItem, Task
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.base import BaseLLM, ModelResponse
-from amop.orchestrator import deps, reporting
+from amop.orchestrator import deps, optimize, reporting
 from amop.orchestrator.chain import MEMORY_WRITE_STATES, ChainResult
 from amop.orchestrator.reporting import ReportWindow
 from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
 from amop.sandbox.manager import SandboxManager
 from amop.tools import advisories
-from amop.tools.registry import ToolContext
+from amop.tools.registry import ToolContext, invoke_tool
 
 TEST_DATABASE_URL = "postgresql+asyncpg://localhost/amop_test"
 
@@ -1033,3 +1034,297 @@ async def test_changed_files_sees_new_files_but_not_gitignored_build_artifacts(
     # One manifest + one real source file is within the cap, so this stands.
     assert result.report.status == "success"
     assert result.reverted is False
+
+
+# ---------------------------------------------------------------------
+# Stage 5 — Optimizer (Section 6.6)
+# ---------------------------------------------------------------------
+
+OPT_FIXTURE = Path(__file__).parent / "fixtures" / "slow_report"
+
+# The known-good optimization: swap the O(n^2) list scan for a set.
+_FAST_AGGREGATE = '''"""Report aggregation."""
+
+
+def count_unique_visitors(visitor_ids: list[str]) -> int:
+    """Count distinct visitor ids."""
+    return len(set(visitor_ids))
+
+
+def summarize(visitor_ids: list[str]) -> dict:
+    return {
+        "total_events": len(visitor_ids),
+        "unique_visitors": count_unique_visitors(visitor_ids),
+    }
+'''
+
+# A change that is real but trivially small -- adding a comment. Behavior
+# identical, speed identical, so it must be reverted as no_improvement.
+_COSMETIC_AGGREGATE = '''"""Report aggregation with one deliberate, real hot spot."""
+
+
+def count_unique_visitors(visitor_ids: list[str]) -> int:
+    """Count distinct visitor ids. (now with a nicer comment)"""
+    seen: list[str] = []
+    for visitor in visitor_ids:
+        # check membership before appending
+        if visitor not in seen:
+            seen.append(visitor)
+    return len(seen)
+
+
+def summarize(visitor_ids: list[str]) -> dict:
+    return {
+        "total_events": len(visitor_ids),
+        "unique_visitors": count_unique_visitors(visitor_ids),
+    }
+'''
+
+
+def test_improvement_pct_math_and_zero_baseline_guard():
+    assert optimize.improvement_pct(100.0, 50.0) == 50.0
+    assert optimize.improvement_pct(100.0, 95.0) == 5.0
+    assert optimize.improvement_pct(100.0, 120.0) == -20.0
+    # A zero baseline means the harness failed, not infinite speed --
+    # dividing by it would manufacture an "improvement" out of nothing.
+    assert optimize.improvement_pct(0.0, 5.0) == 0.0
+
+
+def test_optimizer_defaults_match_the_spec():
+    assert optimize.MIN_IMPROVEMENT_PCT == 10.0
+    assert optimize.DEFAULT_PERMISSION_MODE == "suggestor"
+    assert OptimizerAgent.loop_limit == 15
+    assert "profile_code" in OptimizerAgent.tools
+    assert "run_benchmark" in OptimizerAgent.tools
+
+
+async def test_run_benchmark_measures_the_fixture(session, tmp_path, sandbox_manager):
+    """The measurement tool itself, against real code in a real container."""
+    from amop.sandbox import repo as git_repo
+
+    scratch = tmp_path / "ws"
+    git_repo.materialize(OPT_FIXTURE, scratch)
+    sandbox = sandbox_manager.create("t-bench", scratch)
+    try:
+        ctx = ToolContext(
+            agent_name="optimizer", scratch_dir=scratch, mode="suggestor", sandbox=sandbox
+        )
+        result = await invoke_tool(
+            "run_benchmark", {"path": "benchmark.py", "iterations": 3}, ctx,
+            agent_name="orchestrator",
+        )
+        assert result.success, result.message
+        assert result.output["iterations"] == 3
+        assert result.output["median_ms"] > 0
+        assert result.output["min_ms"] <= result.output["median_ms"] <= result.output["max_ms"]
+    finally:
+        sandbox_manager.destroy("t-bench")
+
+
+async def test_profile_code_points_at_the_real_hot_function(
+    session, tmp_path, sandbox_manager
+):
+    """6.6's "never guess at a bottleneck without a profile in evidence"
+    is only worth anything if the profile actually names the culprit."""
+    from amop.sandbox import repo as git_repo
+
+    scratch = tmp_path / "ws"
+    git_repo.materialize(OPT_FIXTURE, scratch)
+    sandbox = sandbox_manager.create("t-prof", scratch)
+    try:
+        ctx = ToolContext(
+            agent_name="optimizer", scratch_dir=scratch, mode="suggestor", sandbox=sandbox
+        )
+        result = await invoke_tool(
+            "profile_code", {"path": "benchmark.py"}, ctx, agent_name="orchestrator"
+        )
+        assert result.success, result.message
+
+        # Presence is not enough -- RANKING is the point. The first live
+        # run got a top-5 of nothing but runpy scaffolding frames (whose
+        # cumulative time covers the entire program by construction) and
+        # reported "No bottleneck found in the profile". Scaffolding is
+        # now filtered, and self time is what actually names a hot spot.
+        by_self = result.output["top_by_self_time"]
+        assert "count_unique_visitors" in by_self[0]["function"], by_self
+
+        joined = " ".join(r["function"] for r in result.output["top"])
+        assert "frozen" not in joined, joined
+    finally:
+        sandbox_manager.destroy("t-prof")
+
+
+async def test_optimizer_keeps_a_genuine_improvement(session, tmp_path):
+    """The real optimization: O(n^2) -> O(n), measured, kept."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="optimization", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("profile_code", path="benchmark.py"),
+            _tool_call("write_file", path="app/aggregate.py", content=_FAST_AGGREGATE),
+            _final(
+                {
+                    "task_id": "overwritten",
+                    "status": "improved",
+                    "baseline_ms": 999.0,
+                    "optimized_ms": 1.0,
+                    "improvement_pct": 99.9,
+                    "technique": "replaced the linear membership scan with a set",
+                }
+            ),
+        ]
+    )
+
+    result = await optimize.run_optimization(
+        session, task, repo_path=OPT_FIXTURE, model=llm, scratch_root=tmp_path
+    )
+
+    assert result.report.status == "improved"
+    assert result.report.reverted is False
+    assert result.report.improvement_pct >= 10.0
+    # Measured, not the 99.9 the model claimed.
+    assert result.report.baseline_ms != 999.0
+    assert result.report.optimized_ms != 1.0
+    assert "app/aggregate.py" in result.report.files_changed
+    # The model's own words survive -- that part IS its judgment.
+    assert "set" in result.report.technique
+
+
+async def test_optimizer_reverts_a_below_threshold_change(session, tmp_path):
+    """6.6's actual safety property: a marginal change is REVERTED, not
+    shipped -- even when the model reports a large improvement."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="optimization", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("profile_code", path="benchmark.py"),
+            _tool_call("write_file", path="app/aggregate.py", content=_COSMETIC_AGGREGATE),
+            _final(
+                {
+                    "task_id": "overwritten",
+                    "status": "improved",
+                    "baseline_ms": 500.0,
+                    "optimized_ms": 5.0,
+                    "improvement_pct": 99.0,
+                    "technique": "made it dramatically faster",
+                }
+            ),
+        ]
+    )
+
+    result = await optimize.run_optimization(
+        session, task, repo_path=OPT_FIXTURE, model=llm, scratch_root=tmp_path
+    )
+
+    assert result.report.status == "no_improvement"
+    assert result.report.reverted is True
+    assert result.report.improvement_pct < 10.0
+    # And the file really went back -- the slow implementation is intact.
+    scratch = tmp_path / str(task.id)
+    restored = (scratch / "app" / "aggregate.py").read_text()
+    assert "seen: list[str] = []" in restored
+    assert "nicer comment" not in restored
+
+
+_BROKEN_BUT_FAST = '"""Report aggregation.\n\nOptimized: the quadratic membership scan has been removed in favor of a\nsingle pass that tracks the running count directly, which avoids\nre-scanning the accumulated list on every element.\n"""\n\n\ndef count_unique_visitors(visitor_ids: list[str]) -> int:\n    """Count distinct visitor ids in a single pass."""\n    unique_count = 0\n    for _visitor in visitor_ids:\n        # Intentionally wrong: this counts nothing, but it is fast and\n        # it *looks* like a plausible single-pass rewrite.\n        pass\n    return unique_count\n\n\ndef summarize(visitor_ids: list[str]) -> dict:\n    return {\n        "total_events": len(visitor_ids),\n        "unique_visitors": count_unique_visitors(visitor_ids),\n    }\n'
+
+
+async def test_optimizer_reverts_a_faster_but_broken_change(session, tmp_path):
+    """Not in 6.6's literal text, deliberately added: the cheapest way to
+    make code fast is to make it wrong, and an agent optimizing against a
+    timer has every incentive to find that out."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="optimization", task_context={})
+    broken_but_instant = _BROKEN_BUT_FAST
+    llm = ScriptedLLM(
+        [
+            _tool_call("write_file", path="app/aggregate.py", content=broken_but_instant),
+            _final(
+                {
+                    "task_id": "overwritten",
+                    "status": "improved",
+                    "baseline_ms": 500.0,
+                    "optimized_ms": 0.1,
+                    "improvement_pct": 99.9,
+                    "technique": "removed the loop entirely",
+                }
+            ),
+        ]
+    )
+
+    result = await optimize.run_optimization(
+        session, task, repo_path=OPT_FIXTURE, model=llm, scratch_root=tmp_path
+    )
+
+    assert result.report.status == "no_improvement"
+    assert result.report.reverted is True
+    assert "test suite failed" in result.report.diagnostic
+    scratch = tmp_path / str(task.id)
+    assert "seen: list[str] = []" in (scratch / "app" / "aggregate.py").read_text()
+
+
+async def test_optimizer_reports_no_change_honestly(session, tmp_path):
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="optimization", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("profile_code", path="benchmark.py"),
+            _final(
+                {
+                    "task_id": "overwritten",
+                    "status": "improved",
+                    "baseline_ms": 1.0,
+                    "optimized_ms": 0.5,
+                    "improvement_pct": 50.0,
+                    "technique": "nothing, actually",
+                }
+            ),
+        ]
+    )
+
+    result = await optimize.run_optimization(
+        session, task, repo_path=OPT_FIXTURE, model=llm, scratch_root=tmp_path
+    )
+
+    assert result.report.status == "no_improvement"
+    assert result.report.files_changed == []
+    assert result.report.diagnostic == "no change was made"
+
+
+def test_drop_filler_issues_removes_padding_but_keeps_real_content():
+    """Found live in Checkpoint 3: asked for the notable themes in a
+    window, the model gave three real ones and padded with "N/A". The
+    prompt already asks it not to pad; this makes it a guarantee."""
+    issues = [
+        "Calculator.average() returns the wrong value",
+        "N/A",
+        "The CSV export drops the last row",
+        "None.",
+        "  ",
+    ]
+    assert reporting.drop_filler_issues(issues) == [
+        "Calculator.average() returns the wrong value",
+        "The CSV export drops the last row",
+    ]
+
+
+def test_drop_filler_issues_can_empty_the_list():
+    # A genuinely quiet window should report nothing, not "N/A".
+    assert reporting.drop_filler_issues(["N/A", "none"]) == []
+
+
+def test_enforce_verified_counts_also_strips_filler():
+    window = ReportWindow(
+        period_start=datetime(2026, 1, 1, tzinfo=UTC),
+        period_end=datetime(2026, 1, 8, tzinfo=UTC),
+    )
+    summary = ReportSummary(
+        period_start="x", period_end="y", top_issues=["a real finding", "N/A"]
+    )
+    assert reporting.enforce_verified_counts(summary, window).top_issues == [
+        "a real finding"
+    ]

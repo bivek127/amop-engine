@@ -17,6 +17,7 @@ with.
 """
 
 import asyncio
+import json
 import os
 import uuid
 import xml.etree.ElementTree as ET
@@ -619,3 +620,247 @@ async def get_diff(ctx: ToolContext) -> ToolResult:
     except Exception as exc:
         return ToolResult(success=False, error_code="DIFF_ERROR", message=str(exc))
     return ToolResult(success=True, output=diff)
+
+
+# ---------------------------------------------------------------------
+# Milestone 14 tools: measurement for the Optimizer agent (Section 6.6).
+#
+# Both are read-only: they observe how the code behaves, they don't
+# change it. That matters for permissions -- Optimizer runs `suggestor`,
+# but an Investigator-style read-only caller must be able to profile
+# without being denied for attempting a mutation.
+# ---------------------------------------------------------------------
+
+# Section 6.6: "profile before hypothesizing (never guess at a
+# bottleneck without a profile in evidence)".
+BENCHMARK_TIMEOUT_SECONDS = float(
+    os.environ.get("AMOP_BENCHMARK_TIMEOUT_SECONDS", "120")
+)
+DEFAULT_BENCHMARK_ITERATIONS = 5
+MAX_BENCHMARK_ITERATIONS = 25
+
+
+def _benchmark_script(container_path: str, iterations: int) -> str:
+    """Time one entry point N times and report the MEDIAN, not the mean.
+
+    Median because this runs on a developer laptop sharing a CPU with
+    Docker, an editor, and (in this project's case) a 9GB language model
+    -- a single outlier scheduling stall would otherwise move the mean
+    enough to fake a regression or fake an improvement. Section 6.6
+    explicitly warns against shipping a "noisy-benchmark change", and a
+    threshold applied to a mean of 5 runs on a busy machine is exactly
+    that.
+
+    Also reports min/max so a caller can see the spread rather than
+    trusting one number: a median that improved while the spread covers
+    the difference is not evidence of anything.
+    """
+    return (
+        "python - <<'AMOP_BENCH'\n"
+        "import json, runpy, statistics, sys, time\n"
+        "times = []\n"
+        f"for _ in range({iterations}):\n"
+        "    start = time.perf_counter()\n"
+        f"    runpy.run_path({container_path!r}, run_name='__main__')\n"
+        "    times.append((time.perf_counter() - start) * 1000.0)\n"
+        "print('AMOP_BENCH_JSON' + json.dumps({\n"
+        "    'median_ms': statistics.median(times),\n"
+        "    'min_ms': min(times),\n"
+        "    'max_ms': max(times),\n"
+        "    'iterations': len(times),\n"
+        "}))\n"
+        "AMOP_BENCH\n"
+    )
+
+
+def _extract_marked_json(stdout: str, marker: str) -> dict | None:
+    """Pull our own JSON line out of stdout.
+
+    The benchmarked code prints whatever it likes, so the result is
+    tagged with a marker rather than assuming the last line is ours --
+    a target that ends by printing its own summary would otherwise
+    silently become the "measurement".
+    """
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(marker):
+            try:
+                return json.loads(line[len(marker) :])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+@tool(
+    name="run_benchmark",
+    description=(
+        "Time a Python entry point inside the workspace, running it "
+        "several times and reporting the median wall-clock milliseconds "
+        "(plus min/max so you can see the noise). Give the path to a "
+        "script with a __main__ block that does the work, e.g. "
+        "'benchmark.py'. Read-only -- it runs the code, it does not "
+        "change it. Use this BEFORE and AFTER an optimization, against "
+        "the same entry point, to show whether the change actually helped."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "iterations": {"type": "integer"},
+        },
+        "required": ["path"],
+    },
+    mutating=False,
+    timeout_seconds=BENCHMARK_TIMEOUT_SECONDS + 10,
+)
+async def run_benchmark(
+    path: str, ctx: ToolContext, iterations: int = DEFAULT_BENCHMARK_ITERATIONS
+) -> ToolResult:
+    target = resolve_within_scratch(path, ctx.scratch_dir)
+    if target is None:
+        return ToolResult(
+            success=False,
+            error_code="PATH_NOT_PERMITTED",
+            message=f"{path!r} is outside the scratch directory",
+        )
+    if ctx.sandbox is None:
+        return ToolResult(
+            success=False,
+            error_code="SANDBOX_UNAVAILABLE",
+            message="no sandbox session for this task",
+        )
+    iterations = max(1, min(int(iterations), MAX_BENCHMARK_ITERATIONS))
+    container_path = _container_path(target, ctx.scratch_dir)
+
+    command = f"cd /workspace && " + _benchmark_script(container_path, iterations)
+    try:
+        result = await asyncio.to_thread(
+            ctx.sandbox.exec_run, command, BENCHMARK_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        return ToolResult(success=False, error_code="RUN_ERROR", message=str(exc))
+
+    if result.timed_out:
+        return ToolResult(
+            success=False,
+            error_code="TIMEOUT",
+            message=f"benchmark exceeded {BENCHMARK_TIMEOUT_SECONDS}s",
+        )
+
+    payload = _extract_marked_json(result.stdout, "AMOP_BENCH_JSON")
+    if payload is None:
+        return ToolResult(
+            success=False,
+            error_code="BENCHMARK_FAILED",
+            message=(result.stdout + result.stderr)[-2000:]
+            or "benchmark produced no measurement",
+        )
+    return ToolResult(success=True, output=payload)
+
+
+@tool(
+    name="profile_code",
+    description=(
+        "Profile a Python entry point inside the workspace with cProfile "
+        "and return the functions taking the most cumulative time. Give "
+        "the path to a script with a __main__ block, e.g. 'benchmark.py'. "
+        "Returns two rankings: 'top' by cumulative time (which "
+        "includes everything a function calls) and 'top_by_self_time' "
+        "by time spent IN the function itself. For finding a hot spot, "
+        "read top_by_self_time first -- cumulative time credits every "
+        "caller up the stack, so it flatters wrappers. Read-only. Use "
+        "this FIRST, before deciding what to optimize -- a bottleneck "
+        "you guessed at is not a bottleneck you found."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "top_n": {"type": "integer"},
+        },
+        "required": ["path"],
+    },
+    mutating=False,
+    timeout_seconds=BENCHMARK_TIMEOUT_SECONDS + 10,
+)
+async def profile_code(path: str, ctx: ToolContext, top_n: int = 15) -> ToolResult:
+    """Spec 6.6 names this tool `profile_endpoint`.
+
+    Renamed deliberately, not quietly: `profile_endpoint` presumes an
+    HTTP service, and nothing in this project's scope serves one. What a
+    repo here actually has is a Python entry point, so this profiles
+    that. The capability 6.6 depends on -- "never guess at a bottleneck
+    without a profile in evidence" -- is unchanged; only the assumption
+    about what is being profiled is.
+    """
+    target = resolve_within_scratch(path, ctx.scratch_dir)
+    if target is None:
+        return ToolResult(
+            success=False,
+            error_code="PATH_NOT_PERMITTED",
+            message=f"{path!r} is outside the scratch directory",
+        )
+    if ctx.sandbox is None:
+        return ToolResult(
+            success=False,
+            error_code="SANDBOX_UNAVAILABLE",
+            message="no sandbox session for this task",
+        )
+    top_n = max(1, min(int(top_n), 50))
+    container_path = _container_path(target, ctx.scratch_dir)
+
+    command = (
+        "cd /workspace && python - <<'AMOP_PROF'\n"
+        "import cProfile, pstats, io, json, runpy\n"
+        "profiler = cProfile.Profile()\n"
+        "profiler.enable()\n"
+        f"runpy.run_path({container_path!r}, run_name='__main__')\n"
+        "profiler.disable()\n"
+        "buf = io.StringIO()\n"
+        "stats = pstats.Stats(profiler, stream=buf).sort_stats('cumulative')\n"
+        "rows = []\n"
+        "for func, (cc, nc, tt, ct, callers) in stats.stats.items():\n"
+        "    filename = func[0]\n"
+        # The profiler's own scaffolding -- runpy frames and the exec
+        # that launches them -- has, by construction, a cumulative time
+        # covering the ENTIRE run, so sorting by cumtime puts it above
+        # every real function. Live-confirmed the hard way: the first
+        # real Optimizer run got a top-5 of nothing but runpy frames and
+        # concluded "No bottleneck found in the profile". Dropping these
+        # is not cosmetic -- it is the difference between a profile that
+        # names the hot function and one that hides it.
+        "    if filename.startswith('<frozen') or filename in ('~', '<string>'):\n"
+        "        continue\n"
+        "    rows.append({'function': f'{func[0]}:{func[1]}({func[2]})',\n"
+        "                 'calls': nc, 'tottime_s': round(tt, 6),\n"
+        "                 'cumtime_s': round(ct, 6)})\n"
+        "by_cum = sorted(rows, key=lambda r: r['cumtime_s'], reverse=True)\n"
+        # Self time (excluding subcalls) is what actually identifies a
+        # hot spot; cumulative time credits every caller up the stack.
+        "by_self = sorted(rows, key=lambda r: r['tottime_s'], reverse=True)\n"
+        f"print('AMOP_PROF_JSON' + json.dumps({{'top': by_cum[:{top_n}],\n"
+        f"                                      'top_by_self_time': by_self[:{top_n}]}}))\n"
+        "AMOP_PROF\n"
+    )
+    try:
+        result = await asyncio.to_thread(
+            ctx.sandbox.exec_run, command, BENCHMARK_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        return ToolResult(success=False, error_code="RUN_ERROR", message=str(exc))
+
+    if result.timed_out:
+        return ToolResult(
+            success=False,
+            error_code="TIMEOUT",
+            message=f"profile exceeded {BENCHMARK_TIMEOUT_SECONDS}s",
+        )
+
+    payload = _extract_marked_json(result.stdout, "AMOP_PROF_JSON")
+    if payload is None:
+        return ToolResult(
+            success=False,
+            error_code="PROFILE_FAILED",
+            message=(result.stdout + result.stderr)[-2000:]
+            or "profile produced no output",
+        )
+    return ToolResult(success=True, output=payload)
