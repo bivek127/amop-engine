@@ -144,11 +144,48 @@ def changed_files(sandbox: Sandbox, base: str = BASE_BRANCH) -> list[str]:
     self-report alone" -- so the orchestrator reads the changed file list
     out of the repo rather than believing what the model claimed it
     edited.
+
+    Milestone 14 bugfix: `git diff` reports only files git already
+    tracks, so a brand-new file an agent created was invisible here --
+    committed edits and modifications to existing files showed up, but
+    `write_file` to a path that didn't exist yet did not. Everything
+    built on this function inherited the blind spot: the scope guard
+    (6.3.9) couldn't see an out-of-scope NEW file, no-op detection
+    counted a file-creating turn as having changed nothing, and Section
+    6.7's max_files_for_auto_fix cap could be walked straight past by
+    creating rather than editing. Found by a dependency-update test
+    whose agent created four files and was still reported as touching
+    one. `ls-files --others --exclude-standard` closes it, honoring
+    .gitignore so container-generated junk still doesn't count (the
+    Milestone 6 finding about throwaway repos needing their own
+    .gitignore continues to apply).
     """
     committed = _git(sandbox, f"diff --name-only {base} HEAD")
     uncommitted = _git(sandbox, "diff --name-only HEAD")
-    names = {line.strip() for line in (committed + uncommitted).splitlines()}
+    untracked = _git(sandbox, "ls-files --others --exclude-standard")
+    names = {
+        line.strip() for line in (committed + uncommitted + untracked).splitlines()
+    }
     return sorted(n for n in names if n)
+
+
+def revert_to_baseline(sandbox: Sandbox, base: str = BASE_BRANCH) -> None:
+    """Throw away everything an agent did on this branch.
+
+    Spec 6.6 describes the Optimizer's revert as `git checkout --
+    <files>`, which only undoes *uncommitted* work. That isn't enough
+    here: agents in this codebase reach a committed state (commit_all in
+    chain.py's _run_coder), so a checkout-only revert would leave the
+    change sitting on the branch while reporting it reverted -- the
+    exact "the tool said success but the repo says otherwise" failure
+    Milestone 12 found the hard way. `reset --hard` plus `clean -fd`
+    covers committed, staged, unstaged, and newly-created files alike.
+
+    Used by both Section 6.6's below-threshold optimization revert and
+    Section 6.7's over-budget dependency migration abort.
+    """
+    _git(sandbox, f"reset --hard {base}")
+    _git(sandbox, "clean -fd")
 
 
 def _shell_quote(value: str) -> str:

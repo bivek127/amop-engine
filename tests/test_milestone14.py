@@ -28,16 +28,20 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
 
-from amop.agents.handoffs import ReportSummary
+from amop.agents.dependency_updater import DependencyUpdaterAgent
+from amop.agents.handoffs import DependencyUpdateReport, ReportSummary
 from amop.agents.reporter import ReporterAgent
 from amop.database.models import EMBEDDING_DIM, MemoryItem, Task
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.base import BaseLLM, ModelResponse
-from amop.orchestrator import reporting
+from amop.orchestrator import deps, reporting
 from amop.orchestrator.chain import MEMORY_WRITE_STATES, ChainResult
 from amop.orchestrator.reporting import ReportWindow
 from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
+from amop.sandbox.manager import SandboxManager
+from amop.tools import advisories
+from amop.tools.registry import ToolContext
 
 TEST_DATABASE_URL = "postgresql+asyncpg://localhost/amop_test"
 
@@ -66,6 +70,13 @@ async def _fake_embed_texts(texts: list[str], provider=None) -> list[list[float]
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
     monkeypatch.setattr(memory_store, "embed_texts", _fake_embed_texts)
+
+
+@pytest.fixture
+def sandbox_manager():
+    manager = SandboxManager()
+    yield manager
+    manager.destroy_all()
 
 
 # ---------------------------------------------------------------------
@@ -656,3 +667,369 @@ async def test_run_report_counts_dependency_updates_by_task_type(session):
 
     assert window.tasks_created == 2
     assert window.dependencies_updated == 1
+
+
+# ---------------------------------------------------------------------
+# Stage 4 — DependencyUpdater (Section 6.7)
+# ---------------------------------------------------------------------
+
+
+def test_dependency_updater_defaults_to_autonomous_permission():
+    """6.7: the only agent whose default is `autonomous`, on the grounds
+    that a version bump is mechanical, low-blast-radius, and revertible."""
+    assert deps.DEFAULT_PERMISSION_MODE == "autonomous"
+    assert deps.MAX_FILES_FOR_AUTO_FIX == 3
+    assert DependencyUpdaterAgent.handoff_schema is DependencyUpdateReport
+    assert "check_advisories" in DependencyUpdaterAgent.tools
+
+
+def test_source_files_changed_excludes_the_manifest_being_bumped():
+    """6.7 caps "the fix" -- the source changes a new version forces --
+    not the bump itself. Counting the manifest would silently turn a
+    documented budget of 3 into an actual 2."""
+    changed = ["requirements.txt", "app/a.py", "app/b.py"]
+    assert deps.source_files_changed(changed) == ["app/a.py", "app/b.py"]
+
+
+def test_source_files_changed_handles_nested_manifests():
+    assert deps.source_files_changed(["sub/pyproject.toml", "sub/x.py"]) == ["sub/x.py"]
+
+
+def test_parse_requirements_only_accepts_pinned_versions():
+    """An advisory is a claim about a specific version, so an unpinned
+    requirement isn't checkable -- it must be reported as skipped, never
+    silently dropped (which would read as "checked and clean")."""
+    pinned, skipped = advisories.parse_requirements(
+        "\n".join(
+            [
+                "# a comment",
+                "requests==2.19.1",
+                "flask>=2.0  # unpinned, not checkable",
+                "",
+                "-r other.txt",
+                "jinja2==2.10",
+            ]
+        )
+    )
+
+    assert pinned == [("requests", "2.19.1"), ("jinja2", "2.10")]
+    assert skipped == ["flask>=2.0"]
+
+
+def test_parse_requirements_ignores_comments_and_blanks():
+    pinned, skipped = advisories.parse_requirements("\n  \n# nothing here\n")
+    assert pinned == []
+    assert skipped == []
+
+
+def test_fixed_versions_only_reports_the_named_package():
+    """A single OSV advisory can list several affected packages; picking
+    up another package's fixed version would send the agent to a version
+    that doesn't exist for the one it's bumping."""
+    vuln = {
+        "affected": [
+            {
+                "package": {"name": "requests"},
+                "ranges": [{"events": [{"introduced": "0"}, {"fixed": "2.20.0"}]}],
+            },
+            {
+                "package": {"name": "urllib3"},
+                "ranges": [{"events": [{"introduced": "0"}, {"fixed": "1.99.0"}]}],
+            },
+        ]
+    }
+    assert advisories._fixed_versions(vuln, "requests") == ["2.20.0"]
+
+
+async def test_check_advisories_offline_is_an_error_not_an_empty_result(
+    tmp_path, monkeypatch, sandbox_manager
+):
+    """The single most dangerous failure mode for an autonomous updater:
+    "I could not reach the advisory database" must never be reported as
+    "no advisories found"."""
+    (tmp_path / "requirements.txt").write_text("requests==2.19.1\n")
+    monkeypatch.setattr(
+        advisories, "OSV_QUERY_URL", "http://127.0.0.1:9/definitely-not-listening"
+    )
+    sandbox = sandbox_manager.create("t-adv-offline", tmp_path)
+    try:
+        ctx = ToolContext(
+            agent_name="dependency_updater",
+            scratch_dir=tmp_path,
+            mode="autonomous",
+            sandbox=sandbox,
+        )
+        result = await advisories.check_advisories("requirements.txt", ctx=ctx)
+
+        assert not result.success
+        assert result.error_code == "ADVISORY_LOOKUP_FAILED"
+        assert "NOT a statement that the dependencies are clean" in result.message
+    finally:
+        sandbox_manager.destroy("t-adv-offline")
+
+
+async def test_check_advisories_reports_zero_checked_for_an_unpinned_manifest(
+    tmp_path, sandbox_manager
+):
+    # No network call happens at all here -- nothing is pinned, so there
+    # is nothing to look up.
+    (tmp_path / "requirements.txt").write_text("flask\nrequests>=2\n")
+    sandbox = sandbox_manager.create("t-adv-unpinned", tmp_path)
+    try:
+        ctx = ToolContext(
+            agent_name="dependency_updater",
+            scratch_dir=tmp_path,
+            mode="autonomous",
+            sandbox=sandbox,
+        )
+        result = await advisories.check_advisories("requirements.txt", ctx=ctx)
+
+        assert result.success
+        assert result.output["checked"] == 0
+        assert result.output["advisories"] == []
+        assert sorted(result.output["skipped_unpinned"]) == ["flask", "requests>=2"]
+    finally:
+        sandbox_manager.destroy("t-adv-unpinned")
+
+
+async def test_check_advisories_refuses_a_path_outside_the_workspace(
+    tmp_path, sandbox_manager
+):
+    sandbox = sandbox_manager.create("t-adv-escape", tmp_path)
+    try:
+        ctx = ToolContext(
+            agent_name="dependency_updater",
+            scratch_dir=tmp_path,
+            mode="autonomous",
+            sandbox=sandbox,
+        )
+        result = await advisories.check_advisories("../../etc/passwd", ctx=ctx)
+        assert not result.success
+        assert result.error_code == "PATH_NOT_PERMITTED"
+    finally:
+        sandbox_manager.destroy("t-adv-escape")
+
+
+# --- the two paths that must be enforced in code, not by the prompt ---
+
+DEPS_FIXTURE = Path(__file__).parent / "fixtures" / "outdated_deps"
+
+
+def _tool_call(name: str, **arguments) -> str:
+    return json.dumps({"tool_call": {"name": name, "arguments": arguments}})
+
+
+def _deps_answer(**overrides) -> str:
+    payload = {
+        "task_id": "will-be-overwritten",
+        "package": "requests",
+        "from_version": "2.19.1",
+        "to_version": "2.32.0",
+        "cve_ids": ["GHSA-9wx4-h78v-vm56"],
+        "status": "success",
+        "tests_passed": True,
+    }
+    payload.update(overrides)
+    return _final(payload)
+
+
+# A targeted one-line bump -- the correct way to edit a manifest that
+# also holds comments and (in a real repo) other pins. A whole-file
+# write_file here is refused by Milestone 13's SUSPICIOUS_SHRINK guard,
+# which is the guard doing its job: see
+# test_manifest_whole_file_rewrite_is_refused_then_recovers_via_patch.
+_BUMP_DIFF = (
+    "--- a/requirements.txt\n"
+    "+++ b/requirements.txt\n"
+    "@@ -8,1 +8,1 @@\n"
+    "-requests==2.19.1\n"
+    "+requests==2.32.0\n"
+)
+
+
+async def test_dependency_update_success_path_bumps_manifest_and_verifies_tests(
+    session, tmp_path
+):
+    """The happy path, with the verdict coming from a real pytest run in
+    a real container -- not from the model's `tests_passed: True`."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="dependency_update", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("patch_file", path="requirements.txt", diff=_BUMP_DIFF),
+            _deps_answer(),
+        ]
+    )
+
+    result = await deps.run_dependency_update(
+        session,
+        task,
+        repo_path=DEPS_FIXTURE,
+        model=llm,
+        scratch_root=tmp_path,
+    )
+
+    assert result.report.status == "success"
+    assert result.report.tests_passed is True
+    assert result.report.files_changed == ["requirements.txt"]
+    assert result.reverted is False
+    assert "requests==2.32.0" in result.diff
+
+
+async def test_dependency_update_aborts_and_reverts_past_the_file_cap(
+    session, tmp_path
+):
+    """Section 6.7's escalation rule, enforced mechanically: an agent
+    that sprawls across more than max_files_for_auto_fix source files
+    gets its work reverted and handed back as needs_manual_review --
+    regardless of it reporting `status: success, tests_passed: True`."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="dependency_update", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("patch_file", path="requirements.txt", diff=_BUMP_DIFF),
+            _tool_call("write_file", path="app/one.py", content="ONE = 1\n"),
+            _tool_call("write_file", path="app/two.py", content="TWO = 2\n"),
+            _tool_call("write_file", path="app/three.py", content="THREE = 3\n"),
+            _tool_call("write_file", path="app/four.py", content="FOUR = 4\n"),
+            # The model insists everything is fine. It does not get a vote.
+            _deps_answer(status="success", tests_passed=True),
+        ]
+    )
+
+    result = await deps.run_dependency_update(
+        session,
+        task,
+        repo_path=DEPS_FIXTURE,
+        model=llm,
+        scratch_root=tmp_path,
+    )
+
+    assert result.report.status == "needs_manual_review"
+    assert result.report.tests_passed is False
+    assert result.reverted is True
+    assert "over the max_files_for_auto_fix cap" in result.report.diagnostic
+    # And the working tree really was restored, not just relabelled.
+    scratch = tmp_path / str(task.id)
+    assert not (scratch / "app" / "four.py").exists()
+    assert (scratch / "requirements.txt").read_text().strip().endswith("requests==2.19.1")
+
+
+async def test_dependency_update_reverts_when_the_suite_fails(session, tmp_path):
+    """A bump that breaks the suite is reverted too -- an autonomous
+    agent must not leave a red tree behind."""
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="dependency_update", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("patch_file", path="requirements.txt", diff=_BUMP_DIFF),
+            # Break the suite with a single in-budget source edit.
+            # patch_file, not write_file: a whole-file rewrite down to a
+            # stub trips Milestone 13's SUSPICIOUS_SHRINK guard, so the
+            # edit would be refused and the suite would stay green --
+            # the guard protecting the file, correctly, from the very
+            # damage this test is trying to cause.
+            _tool_call(
+                "patch_file",
+                path="app/urls.py",
+                diff=(
+                    "--- a/app/urls.py\n"
+                    "+++ b/app/urls.py\n"
+                    "@@ -12,5 +12,5 @@\n"
+                    " def normalize(url: str) -> str:\n"
+                    '     """Strip whitespace and a single trailing slash from a URL."""\n'
+                    "-    cleaned = url.strip()\n"
+                    '+    cleaned = "definitely not the url"\n'
+                    '     if cleaned.endswith("/") and len(cleaned) > 1:\n'
+                    "         cleaned = cleaned[:-1]\n"
+                ),
+            ),
+            _deps_answer(status="success", tests_passed=True),
+        ]
+    )
+
+    result = await deps.run_dependency_update(
+        session,
+        task,
+        repo_path=DEPS_FIXTURE,
+        model=llm,
+        scratch_root=tmp_path,
+    )
+
+    assert result.report.status == "needs_manual_review"
+    assert result.report.tests_passed is False
+    assert result.reverted is True
+    scratch = tmp_path / str(task.id)
+    assert "def normalize(url: str)" in (scratch / "app" / "urls.py").read_text()
+
+
+async def test_dependency_update_reports_no_change_honestly(session, tmp_path):
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="dependency_update", task_context={})
+    llm = ScriptedLLM([_deps_answer(status="success", tests_passed=True)])
+
+    result = await deps.run_dependency_update(
+        session,
+        task,
+        repo_path=DEPS_FIXTURE,
+        model=llm,
+        scratch_root=tmp_path,
+    )
+
+    assert result.report.status == "needs_manual_review"
+    assert result.report.files_changed == []
+    assert "no change" in result.report.diagnostic
+
+
+async def test_changed_files_sees_new_files_but_not_gitignored_build_artifacts(
+    session, tmp_path
+):
+    """Two halves of the same Milestone 14 finding, pinned together.
+
+    `changed_files()` used to run on `git diff` alone, which ignores
+    untracked paths -- so an agent that CREATED files looked like it had
+    changed nothing, and Section 6.7's max_files_for_auto_fix cap could
+    be walked straight past by creating rather than editing.
+
+    Including untracked files fixed that but immediately surfaced the
+    other half, live: the agent's own run_tests leaves __pycache__/*.pyc
+    behind, and three stray .pyc files are enough to exhaust a cap of 3
+    on their own. `--exclude-standard` honors .gitignore, which is why
+    the fixture now ships one (the Milestone 6 finding, recurring).
+
+    This test drives an agent that both creates a file AND runs the
+    suite, so a regression in either half fails it.
+    """
+    from amop.orchestrator.task import create_task
+
+    task = await create_task(session, task_type="dependency_update", task_context={})
+    llm = ScriptedLLM(
+        [
+            _tool_call("patch_file", path="requirements.txt", diff=_BUMP_DIFF),
+            _tool_call("write_file", path="app/newly_created.py", content="X = 1\n"),
+            # Generates __pycache__ inside the workspace, as a real run does.
+            _tool_call("run_tests"),
+            _deps_answer(),
+        ]
+    )
+
+    result = await deps.run_dependency_update(
+        session,
+        task,
+        repo_path=DEPS_FIXTURE,
+        model=llm,
+        scratch_root=tmp_path,
+    )
+
+    changed = result.report.files_changed
+    # The created file is visible (the bug this fix closed)...
+    assert "app/newly_created.py" in changed
+    # ...and build artifacts are not (the bug the fix introduced).
+    assert not [p for p in changed if "__pycache__" in p or p.endswith(".pyc")], changed
+    # One manifest + one real source file is within the cap, so this stands.
+    assert result.report.status == "success"
+    assert result.reverted is False

@@ -1,0 +1,8 @@
+# Deliberately pinned to a version with real, published advisories, so
+# Section 6.7's check_advisories has something genuine to find (spec
+# 19.3's "real code, real failing input, known-good fix" applied to
+# dependency updates rather than to a bug).
+#
+# Do not "helpfully" bump this by hand -- the whole point is that the
+# DependencyUpdater agent finds and bumps it.
+requests==2.19.1

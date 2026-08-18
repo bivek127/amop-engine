@@ -295,6 +295,48 @@ class WatcherReport(BaseModel):
     alerts: list[AnomalyAlert] = Field(default_factory=list)
 
 
+class DependencyUpdateReport(BaseModel):
+    """Dependency Updater's handoff (6.7).
+
+    Ground truth vs. model judgment: `tests_passed` is overwritten by the
+    orchestrator from the real pytest run, never from the model's claim
+    -- the same rule TestReport.all_passed follows, and the one that
+    matters most here, because this is the only agent whose default
+    permission is `autonomous`. An agent that can act without human
+    review must not also be the one deciding whether its own change was
+    safe.
+
+    `status` is likewise decided in code, not by the model: Section 6.7's
+    escalation rule ("if the fix would require touching more than
+    max_files_for_auto_fix files, abort") is a count of real changed
+    files read back from git, so `needs_manual_review` is a mechanical
+    verdict about blast radius rather than the agent's opinion of its own
+    difficulty.
+
+    `package`/`from_version`/`to_version`/`cve_ids` ARE model-reported:
+    they describe what it decided to do, which is genuine judgment over
+    the advisory data it was shown. They're descriptive metadata, not
+    gates -- nothing downstream is authorized by them.
+    """
+
+    task_id: str
+    package: str = ""
+    from_version: str = ""
+    to_version: str = ""
+    cve_ids: list[str] = Field(default_factory=list)
+    status: Literal["success", "needs_manual_review"] = "needs_manual_review"
+    tests_passed: bool = False
+    files_changed: list[str] = Field(default_factory=list)
+    diagnostic: str | None = Field(
+        default=None,
+        description=(
+            "If you are handing off needs_manual_review, say briefly why "
+            "-- what the update needed that you could not safely do "
+            "mechanically."
+        ),
+    )
+
+
 class ReportSummary(BaseModel):
     """Reporter's handoff (6.8). Summarization only -- Reporter "never
     touches code or opens PRs", which agents/reporter.py enforces

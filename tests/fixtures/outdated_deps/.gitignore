@@ -1,0 +1,9 @@
+# Milestone 6 found this the hard way and Milestone 14 hit it again:
+# the sandbox runs pytest inside the repo, and without a .gitignore the
+# resulting __pycache__/*.pyc artifacts are untracked files that
+# changed_files() now (correctly) reports. That pollutes the changed-file
+# list AND eats into Section 6.7's max_files_for_auto_fix budget -- three
+# stray .pyc files are enough to trip a cap of 3 on their own.
+__pycache__/
+*.py[cod]
+.pytest_cache/

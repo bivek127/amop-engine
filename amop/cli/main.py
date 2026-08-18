@@ -15,6 +15,7 @@ from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
 from amop.orchestrator.chain import run_fix
+from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
 from amop.orchestrator.reporting import run_report
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
@@ -431,6 +432,91 @@ async def _status(task_id: uuid.UUID) -> None:
             f"  [{t.timestamp}] {t.from_state or '(none)'} -> {t.to_state}"
             f"  trigger={t.trigger!r} actor={t.actor!r}"
         )
+
+
+@app.command("update-deps")
+@click.option(
+    "--repo",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Path to the repository whose dependencies should be updated.",
+)
+@click.option(
+    "--manifest",
+    default="requirements.txt",
+    show_default=True,
+    help="Manifest to check, relative to the repo root.",
+)
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+@click.option(
+    "--mode",
+    default=DEFAULT_PERMISSION_MODE,
+    show_default=True,
+    help="Permission mode (Section 6.7 defaults this agent to autonomous).",
+)
+def update_deps(repo: str, manifest: str, model: str, mode: str) -> None:
+    """Bump vulnerable dependencies and verify the suite (Section 6.7)."""
+    asyncio.run(_update_deps(repo, manifest, model, mode))
+
+
+async def _update_deps(repo: str, manifest: str, model: str, mode: str) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        task = await create_task(
+            session,
+            task_type="dependency_update",
+            task_context={"repo": repo, "manifest": manifest},
+        )
+        click.echo(f"Task {task.id}")
+
+        result = await run_dependency_update(
+            session,
+            task,
+            repo_path=Path(repo),
+            model=OllamaProvider(model=model),
+            manifest=manifest,
+            mode=mode,
+            emit=lambda message: click.echo(f"  {message}"),
+        )
+
+    await engine.dispose()
+
+    report = result.report
+    click.echo()
+    # Same reasoning as Milestone 5's tool-call output for `amop fix`:
+    # without this, a needs_manual_review verdict is unfalsifiable from
+    # the outside -- you can see that it gave up but not what it tried.
+    click.echo("Tool calls:")
+    if not result.tool_calls:
+        click.echo("  (none)")
+    for call in result.tool_calls:
+        status = "ALLOWED" if call["success"] else f"FAILED: {call['error_code']}"
+        click.echo(f"  {call['name']} -> {status}")
+        if not call["success"] and call.get("message"):
+            click.echo(f"      {str(call['message'])[:200]}")
+    click.echo()
+    click.echo("Dependency update report (counts/verdict from git and pytest):")
+    click.echo(f"  status       : {report.status}")
+    click.echo(f"  package      : {report.package or '(none reported)'}")
+    click.echo(f"  from -> to   : {report.from_version or '?'} -> {report.to_version or '?'}")
+    click.echo(f"  cve ids      : {', '.join(report.cve_ids) or '(none reported)'}")
+    click.echo(f"  tests passed : {report.tests_passed}")
+    click.echo(f"  files changed: {report.files_changed or '[]'}")
+    click.echo(f"  reverted     : {result.reverted}")
+    if report.diagnostic:
+        click.echo(f"  diagnostic   : {report.diagnostic}")
+    if result.diff:
+        click.echo()
+        click.echo("Diff:")
+        click.echo(result.diff)
+
+    if report.status != "success":
+        sys.exit(2)
 
 
 @app.command()
