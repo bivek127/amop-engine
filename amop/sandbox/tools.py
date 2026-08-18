@@ -105,10 +105,13 @@ def _scoped_default_notice(size_bytes: int, total_lines: int, shown_lines: int) 
         "Optional start_line/end_line (1-indexed, inclusive) read just "
         "that slice instead of the whole file -- use this once you have "
         "a rough idea where the relevant code is (e.g. from search_code's "
-        "line ranges). If you call this WITHOUT start_line/end_line on a "
-        "file that turns out to be large, you will automatically get back "
-        "only its first ~60 lines (not the whole thing, and not an error) "
-        "-- that's expected, re-call with start_line/end_line (using "
+        "line ranges), and keep the span reasonably small (tens of lines, "
+        "not hundreds) -- an oversized range gets silently narrowed to a "
+        "small default too, same as reading with no range at all. If you "
+        "call this WITHOUT start_line/end_line on a file that turns out "
+        "to be large, you will automatically get back only its first ~60 "
+        "lines (not the whole thing, and not an error) -- that's "
+        "expected, re-call with a small start_line/end_line span (using "
         "search_code first, if you can, to know which lines you actually "
         "need) to see the rest. Optional with_line_numbers=true prefixes "
         "each returned line with 'N: ' -- useful when you're about to "
@@ -205,6 +208,35 @@ async def read_file(
                 message=f"start_line/end_line out of range for a {total}-line file",
             )
         selected = lines[lo - 1 : hi]
+
+        # Milestone 12: an explicit range can be just as oversized as an
+        # implicit whole-file read -- live-confirmed, a real
+        # start_line=1, end_line=1675 request (nearly the whole file)
+        # sailed straight past the whole-file-only guard below and,
+        # with with_line_numbers on top, returned something even bigger
+        # than the original unguarded read. Same threshold, same
+        # "silently narrow to a small bounded default with a notice,
+        # don't error" behavior as that guard -- consistency, not a
+        # second, differently-shaped rule.
+        approx_size = sum(len(line) for line in selected)
+        if with_line_numbers:
+            approx_size += sum(len(f"{lo + i}: ") for i in range(len(selected)))
+
+        if approx_size > _SCOPED_READ_THRESHOLD:
+            capped = selected[:_SCOPED_READ_DEFAULT_LINES]
+            capped_hi = lo + len(capped) - 1
+            notice = (
+                f"[NOTE: the requested range (lines {lo}-{hi}, ~{approx_size} "
+                f"chars) is too large to return in full -- narrowed to lines "
+                f"{lo}-{capped_hi} ({len(capped)} lines) instead. Request a "
+                "smaller start_line/end_line span to see a different part.]\n\n"
+            )
+            if with_line_numbers:
+                body = "".join(f"{lo + i}: {line}" for i, line in enumerate(capped))
+            else:
+                body = "".join(capped)
+            return ToolResult(success=True, output=notice + body)
+
         if with_line_numbers:
             return ToolResult(
                 success=True,
