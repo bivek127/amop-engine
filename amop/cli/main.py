@@ -173,12 +173,19 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
             emit=lambda message: click.echo(f"  {message}"),
         )
 
+        # Milestone 15: `diff` joins the fields `_fix` already persisted
+        # -- GET /tasks/{id}/diff needs somewhere real to read from, and
+        # ChainResult.diff was previously computed then discarded the
+        # moment this function returned. Same shape now written by
+        # `_optimize`/`_update_deps` below, so the API can read a
+        # consistent set of task_context keys regardless of task_type.
         task.task_context = {
             **(task.task_context or {}),
             "final_state": result.final_state.value,
             "error": result.error,
             "stages": result.stages,
             "tool_calls": result.tool_calls,
+            "diff": result.diff,
         }
         session.add(task)
         await session.commit()
@@ -487,6 +494,19 @@ async def _optimize(
             emit=lambda message: click.echo(f"  {message}"),
         )
 
+        # Milestone 15: same shape `_fix` persists, so GET /tasks/{id}
+        # (diff, actions) works uniformly across task_type.
+        task.task_context = {
+            **(task.task_context or {}),
+            "final_state": result.report.status,
+            "error": result.report.diagnostic,
+            "stages": result.stages,
+            "tool_calls": result.tool_calls,
+            "diff": result.diff,
+        }
+        session.add(task)
+        await session.commit()
+
     await engine.dispose()
 
     report = result.report
@@ -571,6 +591,18 @@ async def _update_deps(repo: str, manifest: str, model: str, mode: str) -> None:
             mode=mode,
             emit=lambda message: click.echo(f"  {message}"),
         )
+
+        # Milestone 15: same shape `_fix`/`_optimize` persist.
+        task.task_context = {
+            **(task.task_context or {}),
+            "final_state": result.report.status,
+            "error": result.report.diagnostic,
+            "stages": result.stages,
+            "tool_calls": result.tool_calls,
+            "diff": result.diff,
+        }
+        session.add(task)
+        await session.commit()
 
     await engine.dispose()
 
@@ -761,6 +793,22 @@ async def _memory_dispute(memory_id: uuid.UUID, *, disputed: bool) -> None:
         if disputed
         else "It will be eligible for retrieval again."
     )
+
+
+@app.command("serve-api")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8000, show_default=True, type=int)
+def serve_api(host: str, port: int) -> None:
+    """Run the internal REST API (Section 15.1's Command Layer).
+
+    Blocks until interrupted, same shape as `amop watch`'s poll loop.
+    The app is imported by string ("amop.api.app:app"), not by name,
+    deliberately -- this module's own click group is ALSO named `app`;
+    importing FastAPI's app object directly here would shadow it.
+    """
+    import uvicorn
+
+    uvicorn.run("amop.api.app:app", host=host, port=port)
 
 
 if __name__ == "__main__":

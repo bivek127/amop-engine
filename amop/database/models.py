@@ -174,3 +174,61 @@ class MemoryItem(Base):
         Index("ix_memory_items_repo_path", "repo_path"),
         Index("ix_memory_items_disputed", "disputed"),
     )
+
+
+class Repository(Base):
+    """Milestone 15's `GET/POST /repositories` -- an optional registry,
+    NOT the relational hub spec 14.2 imagines. Every existing table
+    (Task.task_context["repo"], CodeChunk.repo_path,
+    MemoryItem.repo_path) already keys on a free-form repo path string;
+    building the spec's normalized `repo_id UUID` this milestone would
+    mean migrating three tables' worth of existing data and every reader
+    of them, for an API surface that only needs a way to list/register
+    repos by name. So this is additive only: a place to register a repo
+    path with a display name, queryable on its own, leaving every
+    existing repo_path column exactly as it is.
+    """
+
+    __tablename__ = "repositories"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    repo_path: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PullRequest(Base):
+    """Milestone 15's `GET /pull-requests`. No PR-tracking table existed
+    before this -- a PR's URL has only ever been a transient field on a
+    ChainResult, printed to CLI stdout and discarded. Written once, the
+    one place a PR is ever actually opened
+    (orchestrator/chain.py's PR_CREATION stage), so this list needs no
+    live call back to GitHub to answer "what PRs has AMOP opened."
+
+    `task_id` has no FK constraint, same reasoning as MemoryItem.task_id
+    above -- a PR record should outlive the task's own retention window.
+    """
+
+    __tablename__ = "pull_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    repo_path: Mapped[str] = mapped_column(Text, nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    number: Mapped[int | None] = mapped_column(Integer)
+    # open | merged | closed -- set to "open" when written (the only
+    # state create_pull_request's own return value can attest to); this
+    # milestone has no poller updating it afterward (that needs
+    # get_ci_status/webhook wiring, explicitly queued separately).
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (Index("ix_pull_requests_repo_path", "repo_path"),)

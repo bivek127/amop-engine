@@ -47,7 +47,7 @@ from amop.agents.investigator import InvestigatorAgent
 from amop.agents.reviewer import ReviewerAgent
 from amop.agents.tester import TesterAgent
 from amop.codebase_intel.indexer import index_repo
-from amop.database.models import Task
+from amop.database.models import PullRequest, Task
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
 from amop.orchestrator.task import transition
@@ -744,6 +744,25 @@ async def run_chain(
 
         result.pr_url = pr_result.output.get("url")
         stage(f"PR_CREATION: opened {result.pr_url}")
+
+        # Milestone 15: the one place a PR is ever actually opened --
+        # persisted here so GET /pull-requests has real rows to serve
+        # without a live GitHub call. Best-effort: a row-write failure
+        # must never undo a PR that already exists on GitHub.
+        try:
+            session.add(
+                PullRequest(
+                    task_id=task.id,
+                    repo_path=ctx.repo_path or "",
+                    url=result.pr_url or "",
+                    number=pr_result.output.get("number"),
+                    status="open",
+                )
+            )
+            await session.commit()
+        except Exception as exc:  # noqa: BLE001 -- see docstring above
+            emit(f"warning: could not record pull_requests row ({exc})")
+
         await go(
             TaskState.WAITING_FOR_APPROVAL,
             actor="system",
