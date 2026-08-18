@@ -255,11 +255,33 @@ async def read_file(
     return ToolResult(success=True, output=content)
 
 
+# Milestone 13: found live in Milestone 12 -- Coder abandoned a
+# correctly-rejected patch_file attempt and fell back to write_file with
+# only a small fragment as the ENTIRE new content of a large, real,
+# existing file. The tool call reported success; the file's actual
+# content was destroyed (1,675 real lines replaced by 18 broken ones).
+# patch_file already refuses a change that doesn't match reality
+# (PATCH_CONFLICT); write_file had no equivalent. This is that
+# equivalent -- a heuristic, not a perfect check (a legitimately huge
+# deletion could still trip it, and that's an acceptable false positive
+# given what it catches). 20% is chosen with real margin above the
+# actual observed failure (18/1675 lines is ~1% of the original, nowhere
+# close to this threshold) while still being restrictive enough to
+# matter -- tuned against that real case, not derived from a formula.
+_SUSPICIOUS_SHRINK_RATIO = 0.20
+
+
 @tool(
     name="write_file",
     description=(
         "Write content to a file inside the scratch workspace, creating "
-        "parent directories as needed. Overwrites the whole file."
+        "parent directories as needed. Overwrites the whole file. If the "
+        "target file already exists and the new content is dramatically "
+        "smaller than what's there now, this is refused with "
+        "error_code=SUSPICIOUS_SHRINK instead of silently overwriting -- "
+        "that's a signal you don't have the full picture of this file; "
+        "re-read it and use patch_file for a targeted change instead of "
+        "retrying write_file. New file creation is unaffected."
     ),
     parameters={
         "type": "object",
@@ -287,6 +309,31 @@ async def write_file(path: str, content: str, ctx: ToolContext) -> ToolResult:
             message="no sandbox session for this task",
         )
     container_path = _container_path(target, ctx.scratch_dir)
+
+    try:
+        current_size = await asyncio.to_thread(ctx.sandbox.stat_size, container_path)
+    except FileNotFoundError:
+        current_size = None  # new file -- nothing to protect, guard doesn't apply
+    except Exception as exc:
+        return ToolResult(success=False, error_code="WRITE_ERROR", message=str(exc))
+
+    if current_size is not None and current_size > 0:
+        new_size = len(content.encode("utf-8"))
+        if new_size < current_size * _SUSPICIOUS_SHRINK_RATIO:
+            return ToolResult(
+                success=False,
+                error_code="SUSPICIOUS_SHRINK",
+                message=(
+                    f"refusing to overwrite {path!r}: new content is {new_size} "
+                    f"bytes, existing file is {current_size} bytes "
+                    f"({new_size / current_size:.1%} of the original) -- this "
+                    "looks like a fragment overwriting a much larger real "
+                    "file, not a deliberate rewrite. Re-read the file to "
+                    "confirm you have the full picture, and use patch_file "
+                    "for a targeted change instead of retrying write_file."
+                ),
+            )
+
     try:
         await asyncio.to_thread(ctx.sandbox.write_file, container_path, content)
     except Exception as exc:
