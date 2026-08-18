@@ -4,11 +4,14 @@ import uuid
 from pathlib import Path
 
 import click
+from sqlalchemy import select
 
 from amop.agents.coder import CoderAgent
 from amop.agents.handoffs import AnomalyAlert
 from amop.agents.watcher import WatcherAgent
+from amop.database.models import MemoryItem
 from amop.database.session import init_db, make_engine, make_session_factory
+from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
 from amop.orchestrator.chain import run_fix
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
@@ -426,6 +429,86 @@ async def _status(task_id: uuid.UUID) -> None:
             f"  [{t.timestamp}] {t.from_state or '(none)'} -> {t.to_state}"
             f"  trigger={t.trigger!r} actor={t.actor!r}"
         )
+
+
+@app.group()
+def memory() -> None:
+    """Inspect and curate long-term incident memory (Section 10)."""
+
+
+@memory.command("list")
+@click.option("--repo", default=None, help="Filter to one repo path.")
+@click.option("--limit", default=20, show_default=True, help="Max rows to show.")
+def memory_list(repo: str | None, limit: int) -> None:
+    """List stored incident memories, newest first."""
+    asyncio.run(_memory_list(repo, limit))
+
+
+async def _memory_list(repo: str | None, limit: int) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc()).limit(limit)
+        if repo:
+            stmt = stmt.where(MemoryItem.repo_path == repo)
+        items = (await session.execute(stmt)).scalars().all()
+
+    if not items:
+        click.echo("(no memories recorded)")
+        return
+    for item in items:
+        content = item.content or {}
+        flag = " [DISPUTED]" if item.disputed else ""
+        click.echo(f"{item.id}{flag}")
+        click.echo(f"  recorded : {item.created_at}")
+        click.echo(f"  repo     : {item.repo_path}")
+        click.echo(f"  outcome  : {content.get('outcome')}")
+        click.echo(f"  reported : {str(content.get('anomaly_signature') or '')[:100]}")
+        click.echo(f"  diagnosed: {str(content.get('root_cause') or '(none)')[:100]}")
+        click.echo()
+
+
+@memory.command("dispute")
+@click.argument("memory_id")
+@click.option(
+    "--undo",
+    is_flag=True,
+    help="Clear the disputed flag instead of setting it.",
+)
+def memory_dispute(memory_id: str, undo: bool) -> None:
+    """Mark a memory as wrong (Section 10.4).
+
+    Disputed memories are excluded from retrieval but never deleted --
+    they stay in the table for audit.
+    """
+    try:
+        parsed_id = uuid.UUID(memory_id)
+    except ValueError:
+        click.echo(f"Not a valid memory id: {memory_id}", err=True)
+        sys.exit(1)
+    asyncio.run(_memory_dispute(parsed_id, disputed=not undo))
+
+
+async def _memory_dispute(memory_id: uuid.UUID, *, disputed: bool) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        found = await memory_store.mark_disputed(session, memory_id, disputed=disputed)
+
+    if not found:
+        click.echo(f"No memory found with id {memory_id}", err=True)
+        sys.exit(1)
+    state = "disputed" if disputed else "no longer disputed"
+    click.echo(f"Memory {memory_id} marked {state}.")
+    click.echo(
+        "Excluded from retrieval; the row is retained for audit (Section 10.4)."
+        if disputed
+        else "It will be eligible for retrieval again."
+    )
 
 
 if __name__ == "__main__":

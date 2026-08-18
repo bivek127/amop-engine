@@ -441,9 +441,20 @@ async def run_chain(
         await go(TaskState.INVESTIGATING, actor="system")
 
         # -- INVESTIGATING -------------------------------------------
+        # Section 10.3: retrieved once here, at task-context-construction
+        # time, and reused for the whole task -- not re-queried inside the
+        # agent's reasoning loop.
+        relevant_memory, memory_hits = await _retrieve_relevant_memory(ctx, description)
+        if memory_hits:
+            stage(
+                f"INVESTIGATING: injected {memory_hits} related past "
+                "incident(s) from memory as evidence"
+            )
         stage("INVESTIGATING: investigator examining the repo")
         report = await _run_agent(
-            agents.investigator, _investigator_prompt(description), result
+            agents.investigator,
+            _investigator_prompt(description, relevant_memory),
+            result,
         )
         report = _retag(report, str(task.id))
         result.root_cause_report = report
@@ -794,12 +805,44 @@ def _retag(handoff, task_id: str):
     return handoff.model_copy(update={"task_id": task_id})
 
 
-def _investigator_prompt(description: str) -> str:
+def _investigator_prompt(description: str, relevant_memory: str = "") -> str:
+    memory_block = f"\n\n{relevant_memory}" if relevant_memory else ""
     return (
-        f"Bug report: {description}\n\n"
+        f"Bug report: {description}{memory_block}\n\n"
         "The repository is checked out at /workspace. Investigate and "
         "report the root cause."
     )
+
+
+async def _retrieve_relevant_memory(
+    ctx: ToolContext, description: str
+) -> tuple[str, int]:
+    """Section 10.3's retrieval, run ONCE per task at context-construction
+    time -- explicitly not per agent-loop iteration, "to keep retrieval
+    cost and prompt-token cost bounded per task rather than per
+    tool-call".
+
+    Returns (rendered_block, match_count). The count is returned rather
+    than recovered by scanning the rendered text, so the operator-facing
+    stage line can't drift from what was actually injected.
+
+    Best-effort for the same reason the write side is: memory is an
+    enhancement to the investigation, so a retrieval failure must degrade
+    to "no memory" rather than fail a task that could otherwise proceed.
+    """
+    if ctx.db_session is None or ctx.repo_path is None:
+        return "", 0
+    try:
+        matches = await memory_store.search_memory(
+            ctx.db_session,
+            description,
+            repo_path=ctx.repo_path,
+            top_k=memory_store.FEW_SHOT_TOP_K,
+            min_similarity=memory_store.RELEVANCE_FLOOR,
+        )
+    except Exception:  # noqa: BLE001 -- see docstring: never fatal
+        return "", 0
+    return memory_store.render_relevant_memory(matches), len(matches)
 
 
 async def _run_coder(

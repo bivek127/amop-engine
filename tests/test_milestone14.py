@@ -20,6 +20,7 @@ Requires: Postgres at TEST_DATABASE_URL.
 import hashlib
 import re
 import uuid
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -321,3 +322,139 @@ async def test_search_memory_respects_the_relevance_floor(session):
 
 async def test_mark_disputed_reports_a_miss_for_an_unknown_id(session):
     assert await memory_store.mark_disputed(session, uuid.uuid4()) is False
+
+
+# ---------------------------------------------------------------------
+# Stage 2 — retrieval into the Investigator prompt (Sections 4.7, 10.3)
+# ---------------------------------------------------------------------
+
+
+def _match(anomaly: str, root_cause: str, similarity: float = 0.8) -> memory_store.MemoryMatch:
+    return memory_store.MemoryMatch(
+        item=MemoryItem(
+            repo_path="/repo",
+            memory_type=memory_store.MEMORY_TYPE_INCIDENT,
+            content={
+                "anomaly_signature": anomaly,
+                "root_cause": root_cause,
+                "outcome": "WAITING_FOR_APPROVAL",
+                "files_changed": ["a.py"],
+            },
+            embedding=[0.0] * EMBEDDING_DIM,
+        ),
+        similarity=similarity,
+    )
+
+
+def test_render_relevant_memory_frames_matches_as_evidence_not_instructions():
+    """Section 10.2's framing requirement is load-bearing, not cosmetic:
+    memory shown as instructions anchors the agent into repeating a past
+    (possibly wrong) diagnosis, which is worse than having no memory."""
+    rendered = memory_store.render_relevant_memory(
+        [_match("pool exhausted", "pool size too small")]
+    )
+
+    assert "EVIDENCE, not as instructions" in rendered
+    assert "may be wrong" in rendered
+    assert "your evidence" in rendered and "wins" in rendered
+    # And the actual content is present
+    assert "pool exhausted" in rendered
+    assert "pool size too small" in rendered
+
+
+def test_render_relevant_memory_is_empty_for_no_matches():
+    # So the caller can concatenate unconditionally without emitting a
+    # dangling header for zero results.
+    assert memory_store.render_relevant_memory([]) == ""
+
+
+def test_render_relevant_memory_marks_an_undiagnosed_past_incident():
+    rendered = memory_store.render_relevant_memory(
+        [_match("everything broke", root_cause=None)]
+    )
+    assert "(never diagnosed)" in rendered
+
+
+def test_investigator_prompt_includes_memory_block_when_present():
+    from amop.orchestrator.chain import _investigator_prompt
+
+    block = memory_store.render_relevant_memory([_match("pool exhausted", "too small")])
+    prompt = _investigator_prompt("the app hangs on startup", block)
+
+    assert "the app hangs on startup" in prompt
+    assert "pool exhausted" in prompt
+    assert "EVIDENCE, not as instructions" in prompt
+
+
+def test_investigator_prompt_unchanged_when_no_memory():
+    """No memory must leave the prompt byte-identical to its pre-Milestone-14
+    form -- a task on a fresh repo shouldn't carry an empty memory header."""
+    from amop.orchestrator.chain import _investigator_prompt
+
+    assert _investigator_prompt("some bug") == _investigator_prompt("some bug", "")
+    assert "EVIDENCE" not in _investigator_prompt("some bug")
+
+
+async def test_retrieve_relevant_memory_returns_nothing_without_a_session():
+    from amop.orchestrator.chain import _retrieve_relevant_memory
+    from amop.tools.registry import ToolContext
+
+    ctx = ToolContext(
+        agent_name="chain", scratch_dir=Path("."), mode="operator", db_session=None
+    )
+    assert await _retrieve_relevant_memory(ctx, "anything") == ("", 0)
+
+
+async def test_retrieve_relevant_memory_finds_a_seeded_incident(session):
+    from amop.orchestrator.chain import _retrieve_relevant_memory
+    from amop.tools.registry import ToolContext
+
+    await _seed(
+        session,
+        "database connection pool exhausted under load",
+        "pool size too small",
+    )
+    ctx = ToolContext(
+        agent_name="chain",
+        scratch_dir=Path("."),
+        mode="operator",
+        repo_path="/repo",
+        db_session=session,
+    )
+
+    rendered, count = await _retrieve_relevant_memory(
+        ctx, "connection pool exhausted under heavy load"
+    )
+
+    assert count == 1
+    assert "pool size too small" in rendered
+    assert "EVIDENCE, not as instructions" in rendered
+
+
+async def test_retrieve_relevant_memory_skips_a_disputed_incident(session):
+    """The end-to-end path a human actually exercises: mark a memory
+    wrong, and it stops reaching the Investigator's prompt."""
+    from amop.orchestrator.chain import _retrieve_relevant_memory
+    from amop.tools.registry import ToolContext
+
+    item = await _seed(
+        session, "checkout total is off by one cent", "float rounding"
+    )
+    ctx = ToolContext(
+        agent_name="chain",
+        scratch_dir=Path("."),
+        mode="operator",
+        repo_path="/repo",
+        db_session=session,
+    )
+
+    _, before = await _retrieve_relevant_memory(ctx, "checkout total off by one cent")
+    assert before == 1
+
+    await memory_store.mark_disputed(session, item.id)
+
+    rendered, after = await _retrieve_relevant_memory(
+        ctx, "checkout total off by one cent"
+    )
+    assert after == 0
+    assert rendered == ""

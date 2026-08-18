@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from amop.agents.handoffs import AnomalyAlert
 from amop.codebase_intel.embeddings import embed_texts
 from amop.database.models import Task
+from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
 from amop.orchestrator.task import create_task, transition
 from amop.safety import circuit_breakers
@@ -130,6 +131,31 @@ async def find_similar_open_task(
         if _cosine_similarity(summary_vec, vec) >= threshold:
             return task
     return None
+
+
+async def _find_prior_resolved_incident(
+    session: AsyncSession, summary: str, local_path: Path | None
+):
+    """Milestone 14: the resolved-history half of dedup, backed by
+    long-term memory (Section 10.2's first consumer).
+
+    Returns a MemoryMatch or None. Best-effort -- an unavailable
+    embedding model must not stop triage, since this is advisory
+    context, not a gate.
+    """
+    if local_path is None:
+        return None
+    try:
+        matches = await memory_store.search_memory(
+            session,
+            summary,
+            repo_path=str(Path(local_path).resolve()),
+            top_k=1,
+            min_similarity=DEDUP_SIMILARITY_THRESHOLD,
+        )
+    except Exception:  # noqa: BLE001 -- advisory only, never blocks triage
+        return None
+    return matches[0] if matches else None
 
 
 async def triage_anomaly(
@@ -216,6 +242,28 @@ async def triage_anomaly(
         )
         emit(f"MERGED_INTO_EXISTING: duplicate of task {dup.id}")
         return task
+
+    # Milestone 14 / Section 10.2's second dedup consumer: layer 1b above
+    # can only ever see NON-terminal tasks, so a bug that was already
+    # diagnosed and closed months ago is invisible to it. Long-term
+    # memory is exactly the record of those.
+    #
+    # Deliberately advisory, not a MERGED_INTO_EXISTING transition: that
+    # transition's own spec trigger is "dedup match against open
+    # incident", and a recurring bug whose earlier fix did not hold is a
+    # genuinely NEW task that happens to rhyme with an old one -- not a
+    # duplicate of something a human could go look at. Silently closing
+    # it would suppress precisely the signal (this regressed) that makes
+    # incident memory worth keeping. So: surfaced to the operator, and
+    # the task proceeds.
+    prior = await _find_prior_resolved_incident(session, alert.summary, local_path)
+    if prior is not None:
+        emit(
+            f"NOTE: similar past incident on record ({prior.similarity:.2f} "
+            f"similarity, outcome={prior.item.content.get('outcome')}): "
+            f"{str(prior.item.content.get('root_cause'))[:120]} "
+            "-- proceeding anyway (possible recurrence, not a duplicate)"
+        )
 
     streak_check = await circuit_breakers.check_failure_streak(
         session, alert.repo, alert.github_issue_number, exclude_task_id=task.id
