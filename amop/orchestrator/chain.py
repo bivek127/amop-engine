@@ -48,7 +48,8 @@ from amop.agents.reviewer import ReviewerAgent
 from amop.agents.tester import TesterAgent
 from amop.codebase_intel.indexer import index_repo
 from amop.database.models import Task
-from amop.orchestrator.state_machine import TRANSITIONS, TaskState
+from amop.memory import store as memory_store
+from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
 from amop.orchestrator.task import transition
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
@@ -1095,6 +1096,53 @@ async def _create_pull_request(
 
 
 # ---------------------------------------------------------------------
+# Milestone 14 / Section 10.2: write-on-resolution incident memory
+# ---------------------------------------------------------------------
+
+# Section 10.2 says "every resolved task (terminal state RESOLVED or
+# FAILED)". Taken literally against THIS state machine, that hook would
+# almost never fire: nothing in the codebase ever transitions to RESOLVED
+# (its only legal predecessor is MERGED, and nothing reaches that either
+# -- auto-merge isn't built). Since Milestone 6 a successful run ends at
+# WAITING_FOR_APPROVAL, which isn't even in TERMINAL_STATES. So a literal
+# reading would record failures only, and few-shot retrieval would learn
+# exclusively from things that went wrong.
+#
+# What the spec is actually asking for is "the task is over, record what
+# happened", so that's what this is: every terminal state, plus
+# WAITING_FOR_APPROVAL as the de-facto success terminal today. When the
+# MERGED -> RESOLVED path does get built, RESOLVED is already in the set
+# and nothing here needs to change.
+MEMORY_WRITE_STATES = frozenset(TERMINAL_STATES | {TaskState.WAITING_FOR_APPROVAL})
+
+
+async def _record_incident_memory(
+    session: AsyncSession,
+    result: ChainResult,
+    repo_path: str,
+    emit: Callable[[str], None],
+) -> None:
+    """Section 10.2's write-on-resolution, called once per completed
+    chain run.
+
+    Deliberately best-effort: a memory is a record of work already done,
+    so failing to write one must never turn a finished task into a failed
+    one. The exception is caught, surfaced to the operator, and dropped.
+    """
+    if result.final_state not in MEMORY_WRITE_STATES:
+        return
+    try:
+        item = await memory_store.write_incident_memory(
+            session, result, repo_path=repo_path
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never fatal
+        emit(f"memory: failed to record incident memory ({exc})")
+        return
+    if item is not None:
+        emit(f"memory: recorded incident memory {item.id}")
+
+
+# ---------------------------------------------------------------------
 # Full lifecycle entry point
 # ---------------------------------------------------------------------
 
@@ -1152,8 +1200,10 @@ async def run_fix(
         agents = ChainAgents.build(model, ctx, task_id)
         emit(f"Sandbox container: {sandbox.short_id}")
         emit(f"Workspace: {scratch_dir}")
-        return await run_chain(
+        result = await run_chain(
             session, task, description=description, ctx=ctx, agents=agents, emit=emit
         )
+        await _record_incident_memory(session, result, resolved_repo_path, emit)
+        return result
     finally:
         await asyncio.to_thread(manager.destroy, task_id)
