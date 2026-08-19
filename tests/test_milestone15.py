@@ -22,7 +22,7 @@ from amop.api.deps import get_session
 from amop.database.models import MemoryItem, PullRequest, Repository, Task
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.orchestrator.state_machine import TaskState
-from amop.orchestrator.task import create_task, transition
+from amop.orchestrator.task import create_task, get_task, transition
 
 TEST_DATABASE_URL = "postgresql+asyncpg://localhost/amop_test"
 TEST_TOKEN = "test-token-do-not-use-in-prod"
@@ -886,3 +886,47 @@ async def test_web_task_detail_404s_for_an_unknown_id(client):
     await client.post("/web/login", data={"token": TEST_TOKEN})
     r = await client.get(f"/web/tasks/{uuid.uuid4()}")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# Stage 4 -- CLI/API consistency. The CLI stays on direct orchestrator
+# calls this milestone (the plan's own stated scope decision) rather
+# than a rewrite to HTTP; what "confirm consistency" means in practice
+# is that both paths write/read the exact same Postgres row through the
+# exact same shared functions -- `amop fix`'s `_fix` and `POST /tasks`
+# both call `create_task()`; `amop status`'s `_status` and
+# `GET /tasks/{id}` both call `get_task()`. Proven here without running
+# a full, expensive live chain (Docker/Ollama/GitHub) just to check a
+# row's visibility.
+# ---------------------------------------------------------------------
+
+
+async def test_a_task_created_via_the_cli_path_is_visible_through_the_api(client, session):
+    # Same call `_fix` makes before it ever launches the agent chain.
+    task = await create_task(
+        session, task_type="bug_fix", task_context={"prompt": "cli-created", "repo": "/tmp/x"}
+    )
+
+    r = await client.get(f"/tasks/{task.id}")
+
+    assert r.status_code == 200
+    assert r.json()["id"] == str(task.id)
+    assert r.json()["task_context"]["prompt"] == "cli-created"
+
+
+async def test_a_task_created_via_the_api_is_visible_through_the_cli_path(
+    client, session, auth_headers
+):
+    r = await client.post(
+        "/tasks",
+        json={"task_type": "bug_fix", "description": "api-created"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 201
+    task_id = uuid.UUID(r.json()["id"])
+
+    # Same call `amop status`'s `_status` makes.
+    task = await get_task(session, task_id)
+
+    assert task is not None
+    assert task.task_context["prompt"] == "api-created"
