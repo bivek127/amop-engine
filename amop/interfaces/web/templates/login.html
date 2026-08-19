@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Log in — AMOP{% endblock %}
+{% block content %}
+<form class="login-form" method="post" action="/web/login">
+  <h1>AMOP</h1>
+  {% if error %}<p class="error">Incorrect token.</p>{% endif %}
+  <input type="password" name="token" placeholder="API token" autofocus required>
+  <button type="submit">Log in</button>
+</form>
+{% endblock %}

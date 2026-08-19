@@ -814,3 +814,75 @@ async def test_notify_job_notifies_only_on_new_arrivals(patch_bot_api, session):
     kwargs = context.bot.send_message.call_args.kwargs
     assert kwargs["chat_id"] == 42
     assert str(new_task.id)[:8] in kwargs["text"]
+
+
+# ---------------------------------------------------------------------
+# Stage 3 -- Web dashboard: session-cookie login (same shared
+# AMOP_API_TOKEN every other interface holds), task list grouped by
+# state, task detail with a diff viewer.
+# ---------------------------------------------------------------------
+
+
+async def test_web_login_page_loads(client):
+    r = await client.get("/web/login")
+    assert r.status_code == 200
+    assert "form" in r.text.lower()
+
+
+async def test_web_login_wrong_token_redirects_with_error(client):
+    r = await client.post("/web/login", data={"token": "wrong"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/web/login?error=1"
+    assert "amop_session" not in client.cookies
+
+
+async def test_web_login_correct_token_sets_cookie_and_redirects(client):
+    r = await client.post(
+        "/web/login", data={"token": TEST_TOKEN}, follow_redirects=False
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/web/tasks"
+    assert "amop_session" in r.cookies
+
+
+async def test_web_tasks_requires_a_session(client):
+    r = await client.get("/web/tasks", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/web/login"
+
+
+async def test_web_tasks_lists_a_real_task_grouped_by_state(client, session):
+    task = await create_task(
+        session, task_type="bug_fix", task_context={"prompt": "checkout page 500s"}
+    )
+    await transition(session, task, TaskState.TRIAGING)
+
+    await client.post("/web/login", data={"token": TEST_TOKEN})
+    r = await client.get("/web/tasks")
+
+    assert r.status_code == 200
+    assert "TRIAGING" in r.text
+    assert str(task.id)[:8] in r.text
+    assert "checkout page 500s" in r.text
+
+
+async def test_web_task_detail_shows_the_diff(client, session):
+    task = await create_task(
+        session,
+        task_type="bug_fix",
+        task_context={"prompt": "fix it", "diff": "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n"},
+    )
+
+    await client.post("/web/login", data={"token": TEST_TOKEN})
+    r = await client.get(f"/web/tasks/{task.id}")
+
+    assert r.status_code == 200
+    assert "fix it" in r.text
+    assert "-old" in r.text
+    assert "+new" in r.text
+
+
+async def test_web_task_detail_404s_for_an_unknown_id(client):
+    await client.post("/web/login", data={"token": TEST_TOKEN})
+    r = await client.get(f"/web/tasks/{uuid.uuid4()}")
+    assert r.status_code == 404

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Tasks — AMOP{% endblock %}
+{% block content %}
+<h1>Tasks</h1>
+{% if not groups %}
+  <p>No tasks yet.</p>
+{% endif %}
+{% for group in groups %}
+  <div class="group-header">{{ group.state }} ({{ group.count }})</div>
+  {% for task in group.tasks %}
+    <div class="task-row">
+      <span class="task-id"><a href="/web/tasks/{{ task.id }}">{{ task.id|string|truncate(8, True, '') }}</a></span>
+      <span class="task-type">{{ task.task_type }}</span>
+      <span class="task-desc">{{ (task.task_context or {}).get('prompt') or '' }}</span>
+    </div>
+  {% endfor %}
+  {% if group.overflow > 0 %}
+    <div class="overflow-note">...and {{ group.overflow }} more</div>
+  {% endif %}
+{% endfor %}
+{% endblock %}

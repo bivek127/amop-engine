@@ -15,11 +15,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from amop.api.deps import configure_session_factory
 from amop.api.routes import memory, pull_requests, reports, repositories, tasks
 from amop.database.session import init_db, make_engine, make_session_factory
+from amop.interfaces.web.auth import WebAuthRequired
+from amop.interfaces.web.routes import router as web_router
 from amop.orchestrator.state_machine import IllegalTransitionError
 
 logger = logging.getLogger("amop.api")
@@ -42,6 +44,16 @@ def create_app() -> FastAPI:
     app.include_router(pull_requests.router)
     app.include_router(memory.router)
     app.include_router(reports.router)
+    app.include_router(web_router)
+
+    @app.exception_handler(WebAuthRequired)
+    async def _web_auth_required_handler(
+        request: Request, exc: WebAuthRequired
+    ) -> RedirectResponse:
+        # A distinct handler from the API's own 401 envelope below: a
+        # browser without a session cookie needs a redirect to the login
+        # page, not a JSON body it has no way to act on.
+        return RedirectResponse(url="/web/login", status_code=303)
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:

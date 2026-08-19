@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ task.task_type }} {{ task.id|string|truncate(8, True, '') }} — AMOP{% endblock %}
+{% block content %}
+<p><a href="/web/tasks">&larr; back to tasks</a></p>
+<h1>{{ task.task_type }}</h1>
+<table class="meta-table">
+  <tr><td>ID</td><td>{{ task.id }}</td></tr>
+  <tr><td>State</td><td>{{ task.state }}</td></tr>
+  <tr><td>Severity</td><td>{{ task.severity or "—" }}</td></tr>
+  <tr><td>Repo</td><td>{{ repo or "—" }}</td></tr>
+  <tr><td>Created</td><td>{{ task.created_at }}</td></tr>
+  <tr><td>Updated</td><td>{{ task.updated_at or "—" }}</td></tr>
+</table>
+{% if prompt %}
+  <h2>Description</h2>
+  <p>{{ prompt }}</p>
+{% endif %}
+<h2>Diff</h2>
+{% if diff %}
+  <pre>{{ diff }}</pre>
+{% else %}
+  <p>No diff recorded for this task.</p>
+{% endif %}
+{% endblock %}
