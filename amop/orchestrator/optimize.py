@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from amop.agents.handoffs import OptimizationReport
 from amop.agents.optimizer import OptimizerAgent
 from amop.database.models import Task
+from amop.orchestrator.concurrency import gated_by_task_slot
 from amop.orchestrator.state_machine import TaskState
 from amop.orchestrator.task import transition
 from amop.sandbox import repo as git_repo
@@ -88,6 +89,7 @@ async def _benchmark(ctx: ToolContext, entry_point: str) -> float | None:
     return float(result.output.get("median_ms", 0.0))
 
 
+@gated_by_task_slot
 async def run_optimization(
     session: AsyncSession,
     task: Task,

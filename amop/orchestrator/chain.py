@@ -26,6 +26,7 @@ consequences.
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +51,12 @@ from amop.codebase_intel.indexer import index_repo
 from amop.database.models import PullRequest, Task
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
+from amop.orchestrator.concurrency import (
+    engine_for,
+    gated_by_task_slot,
+    repo_file_lock,
+    try_repo_file_lock,
+)
 from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
@@ -407,6 +414,9 @@ async def run_chain(
     """
     result = ChainResult(task=task, final_state=TaskState(task.state))
     result.container_id = ctx.sandbox.short_id if ctx.sandbox else None
+    # Section 4.3's advisory locks, released when this stack closes --
+    # on success, on failure, or by the connection dying with the process.
+    repo_locks = AsyncExitStack()
 
     async def go(to_state: TaskState, actor: str, trigger: str | None = None) -> None:
         nonlocal task
@@ -527,6 +537,28 @@ async def run_chain(
         # that actually sent the task back.
         coding_actor = f"agent:{agents.investigator.name}"
         coding_trigger: str | None = None
+
+        # Section 4.3: acquire before entering CODING, keyed on the repo
+        # and the file set the Investigator declared in PLANNING_FIX.
+        #
+        # Held for the whole edit/test/review cycle rather than just the
+        # CODING hop: the working tree stays dirty through TESTING and
+        # REVIEWING (and the loop can re-enter CODING several times), so
+        # releasing at the end of the first CODING would leave another
+        # task free to edit the same files while this one is still
+        # deciding whether its own change is good.
+        declared = [f for f in (report.affected_files or []) if f and f.strip()]
+        if declared:
+            result.stages.append(
+                f"CODING: waiting on repo lock for {sorted(declared)}"
+                if not await try_repo_file_lock(
+                    engine_for(session), ctx.repo_path or "", declared
+                )
+                else f"CODING: holding repo lock for {sorted(declared)}"
+            )
+        await repo_locks.enter_async_context(
+            repo_file_lock(engine_for(session), ctx.repo_path or "", declared)
+        )
 
         while True:
             # -- CODING ----------------------------------------------
@@ -794,6 +826,8 @@ async def run_chain(
         result.error = str(exc)
         stage(f"{failure_state.value}: {exc}")
         return result
+    finally:
+        await repo_locks.aclose()
 
 
 # ---------------------------------------------------------------------
@@ -1217,6 +1251,7 @@ async def _record_incident_memory(
 # ---------------------------------------------------------------------
 
 
+@gated_by_task_slot
 async def run_fix(
     session: AsyncSession,
     task: Task,

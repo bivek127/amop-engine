@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from amop.agents.dependency_updater import DependencyUpdaterAgent
 from amop.agents.handoffs import DependencyUpdateReport
 from amop.database.models import Task
+from amop.orchestrator.concurrency import gated_by_task_slot
 from amop.orchestrator.state_machine import TaskState
 from amop.orchestrator.task import transition
 from amop.sandbox import repo as git_repo
@@ -76,6 +77,7 @@ def _noop(_message: str) -> None:
     pass
 
 
+@gated_by_task_slot
 async def run_dependency_update(
     session: AsyncSession,
     task: Task,

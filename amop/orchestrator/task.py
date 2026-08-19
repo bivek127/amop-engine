@@ -95,6 +95,16 @@ async def transition(
             timestamp=now,
         )
     )
+    # Captured BEFORE the rollback below. session.rollback() expires every
+    # attribute on the instance, so reading task.id afterwards triggers a
+    # lazy reload -- synchronous IO on an async session, which raises
+    # MissingGreenlet and buries the real conflict under a confusing error.
+    #
+    # The tests did not catch this: they asserted that the losing writer
+    # raised *something*, and MissingGreenlet satisfied that perfectly.
+    # Found by running the live demo instead. The assertion now pins the
+    # exception TYPE, which is what would have caught it.
+    task_id = task.id
     try:
         await session.commit()
     except StaleDataError as exc:
@@ -103,7 +113,7 @@ async def transition(
         # from this transaction persists, including the task_transitions
         # audit row, which is what keeps the trail honest.
         await session.rollback()
-        raise ConcurrentUpdateError(task.id, to_state) from exc
+        raise ConcurrentUpdateError(task_id, to_state) from exc
     await session.refresh(task)
     return task
 
@@ -127,6 +137,7 @@ async def transition_with_retry(
     an illegal move surfaces as IllegalTransitionError rather than
     silently landing.
     """
+    task_id = task.id  # same expiry hazard as above
     for attempt in range(max_retries):
         try:
             return await transition(
@@ -139,7 +150,7 @@ async def transition_with_retry(
             # rather than handing back the same stale object. Without it
             # expire_on_commit=False means the retry re-reads its own
             # stale snapshot and conflicts forever.
-            refreshed = await session.get(Task, task.id, populate_existing=True)
+            refreshed = await session.get(Task, task_id, populate_existing=True)
             if refreshed is None:
                 raise
             task = refreshed
@@ -147,7 +158,7 @@ async def transition_with_retry(
             # IllegalTransitionError if the competing writer moved it
             # somewhere this transition may not follow from.
             validate_transition(TaskState(task.state), to_state)
-    raise ConcurrentUpdateError(task.id, to_state)
+    raise ConcurrentUpdateError(task_id, to_state)
 
 
 async def get_task(session: AsyncSession, task_id: uuid.UUID) -> Task | None:

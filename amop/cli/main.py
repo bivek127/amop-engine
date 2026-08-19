@@ -811,6 +811,39 @@ def serve_api(host: str, port: int) -> None:
     uvicorn.run("amop.api.app:app", host=host, port=port)
 
 
+@app.command()
+def concurrency() -> None:
+    """Show the concurrency limits and what is running right now.
+
+    Section 4.3's limits are configurable but were previously invisible;
+    this makes "why was my task refused?" answerable without reading the
+    source or guessing at an env var.
+    """
+    from amop.orchestrator import concurrency as conc
+
+    active_global, per_repo = conc.active_counts()
+    click.echo("Concurrency limits (Section 4.3):")
+    click.echo(
+        f"  max_concurrent_tasks_global    {conc.MAX_CONCURRENT_TASKS_GLOBAL}"
+        f"   (AMOP_MAX_CONCURRENT_TASKS_GLOBAL, default"
+        f" {conc.DEFAULT_MAX_CONCURRENT_TASKS_GLOBAL})"
+    )
+    click.echo(
+        f"  max_concurrent_tasks_per_repo  {conc.MAX_CONCURRENT_TASKS_PER_REPO}"
+        f"   (AMOP_MAX_CONCURRENT_TASKS_PER_REPO, default"
+        f" {conc.DEFAULT_MAX_CONCURRENT_TASKS_PER_REPO})"
+    )
+    click.echo()
+    # Slots are per-process (Section 4.5), so this reports THIS process
+    # only -- saying so plainly beats a number that looks global and
+    # isn't.
+    click.echo(f"Active in this process: {active_global}")
+    for repo, count in sorted(per_repo.items()):
+        click.echo(f"  {count}  {repo}")
+    if not per_repo:
+        click.echo("  (nothing running here)")
+
+
 @app.command("serve-telegram")
 def serve_telegram() -> None:
     """Run the Telegram bot (Section 16.1).
