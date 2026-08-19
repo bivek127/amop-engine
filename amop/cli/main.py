@@ -811,5 +811,18 @@ def serve_api(host: str, port: int) -> None:
     uvicorn.run("amop.api.app:app", host=host, port=port)
 
 
+@app.command("serve-telegram")
+def serve_telegram() -> None:
+    """Run the Telegram bot (Section 16.1).
+
+    An API client -- calls the running `amop serve-api` process over
+    HTTP (AMOP_API_BASE_URL, default http://127.0.0.1:8000), so that
+    must already be up. Blocks until interrupted.
+    """
+    from amop.interfaces.telegram_bot.bot import main as bot_main
+
+    bot_main()
+
+
 if __name__ == "__main__":
     app()

@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from amop.api.deps import configure_session_factory
-from amop.api.routes import memory, pull_requests, repositories, tasks
+from amop.api.routes import memory, pull_requests, reports, repositories, tasks
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.orchestrator.state_machine import IllegalTransitionError
 
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(repositories.router)
     app.include_router(pull_requests.router)
     app.include_router(memory.router)
+    app.include_router(reports.router)
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:

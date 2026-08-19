@@ -19,7 +19,7 @@ dependencies = [
     "uvicorn[standard]",
     "jinja2",
     "itsdangerous",
-    "python-telegram-bot",
+    "python-telegram-bot[job-queue]",
 ]
 
 [project.optional-dependencies]

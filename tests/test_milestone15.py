@@ -15,7 +15,7 @@ import uuid
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from amop.api.app import app
 from amop.api.deps import get_session
@@ -435,3 +435,382 @@ async def test_memory_filters_by_type(client, session):
     r = await client.get("/memory", params={"type": "codebase_note"})
     assert len(r.json()) == 1
     assert r.json()[0]["memory_type"] == "codebase_note"
+
+
+# ---------------------------------------------------------------------
+# Stage 2 — Telegram Bot (Section 16.1)
+#
+# The bot is an API client (see bot.py's own docstring), so these tests
+# route its `_api_get`/`_api_post` through the SAME in-process ASGI
+# client already built for Stage 1 -- a real request cycle through the
+# real route handlers, just without an actual TCP socket, reusing the
+# `client`/`engine` fixtures rather than standing up a second app.
+# ---------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock
+
+from amop.interfaces.telegram_bot import bot as bot_module
+
+_APPROVE_PATH = (
+    TaskState.TRIAGING,
+    TaskState.INVESTIGATING,
+    TaskState.PLANNING_FIX,
+    TaskState.CODING,
+    TaskState.TESTING,
+    TaskState.REVIEWING,
+    TaskState.PR_CREATION,
+    TaskState.WAITING_FOR_APPROVAL,
+)
+
+
+@pytest.fixture
+def patch_bot_api(monkeypatch, client):
+    """Route the bot's API calls through the in-process test client
+    instead of a real socket to AMOP_API_BASE_URL."""
+
+    async def _get(path, params=None):
+        return await client.get(path, params=params)
+
+    async def _post(path, json=None):
+        return await client.post(path, json=json, headers=bot_module._auth_headers())
+
+    monkeypatch.setattr(bot_module, "_api_get", _get)
+    monkeypatch.setattr(bot_module, "_api_post", _post)
+    monkeypatch.setattr(bot_module, "API_TOKEN", TEST_TOKEN)
+    monkeypatch.setenv("AMOP_TELEGRAM_ALLOWED_USER_IDS", "42")
+    return bot_module
+
+
+def _fake_update(user_id: int | None):
+    update = MagicMock()
+    if user_id is None:
+        update.effective_user = None
+    else:
+        update.effective_user.id = user_id
+    update.message.reply_text = AsyncMock()
+    return update
+
+
+def _fake_context(args=None):
+    context = MagicMock()
+    context.args = args or []
+    context.bot.send_message = AsyncMock()
+    context.application.bot_data = {}
+    return context
+
+
+def _reply_texts(update) -> list[str]:
+    return [c.args[0] for c in update.message.reply_text.call_args_list]
+
+
+# --- classify_intent: pure, no I/O -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("the login page returns a 500 error on submit", "bug_fix"),
+        ("please update the vulnerable requests dependency", "dependency_update"),
+        ("this endpoint is really slow, please optimize it", "optimization"),
+        ("bump the outdated CVE package", "dependency_update"),
+    ],
+)
+def test_classify_intent_routes_to_the_right_task_type(text, expected):
+    assert bot_module.classify_intent(text) == expected
+
+
+@pytest.mark.parametrize("text", ["help", "fix it", "please"])
+def test_classify_intent_returns_none_for_too_little_signal(text):
+    assert bot_module.classify_intent(text) is None
+
+
+def test_classify_intent_returns_none_on_conflicting_signals():
+    # A genuine conflict -- can't be a dependency bump AND a performance
+    # fix at once -- must ask, not guess between them.
+    assert (
+        bot_module.classify_intent("update the outdated dependency to optimize speed")
+        is None
+    )
+
+
+def test_allowed_user_ids_parses_the_env_var(monkeypatch):
+    monkeypatch.setenv("AMOP_TELEGRAM_ALLOWED_USER_IDS", "1, 2,3")
+    assert bot_module.allowed_user_ids() == {1, 2, 3}
+
+
+def test_allowed_user_ids_empty_when_unset(monkeypatch):
+    monkeypatch.delenv("AMOP_TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    assert bot_module.allowed_user_ids() == set()
+
+
+# --- /status -------------------------------------------------------------
+
+
+async def test_status_command_rejects_an_unlisted_user(patch_bot_api):
+    update = _fake_update(user_id=999)  # not in the "42" allowlist
+    await bot_module.status_command(update, _fake_context())
+    assert "not authorized" in _reply_texts(update)[0].lower()
+
+
+async def test_status_command_lists_active_tasks(patch_bot_api, session):
+    task = await create_task(session, task_type="bug_fix", task_context={})
+    await transition(session, task, TaskState.TRIAGING)
+
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    text = _reply_texts(update)[0]
+    assert str(task.id)[:8] in text
+    assert "TRIAGING" in text
+    assert "In progress" in text  # grouped under the right header
+    # Regression test for a second real live bug: the group header's own
+    # "(N)" count used literal, un-escaped parens -- MarkdownV2 rejects
+    # a bare '(' the same as the no-description case, so this shipped
+    # broken even after that first fix landed.
+    assert "\\(1\\)" in text
+    assert "(1)" not in text
+
+
+async def test_status_command_reports_when_there_are_no_tasks_at_all(patch_bot_api, session):
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    assert "no tasks yet" in _reply_texts(update)[0].lower()
+
+
+async def test_status_command_groups_a_terminal_task_under_done(patch_bot_api, session):
+    task = await create_task(session, task_type="bug_fix", task_context={})
+    await transition(session, task, TaskState.CANCELLED)
+
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    text = _reply_texts(update)[0]
+    assert "Done" in text
+    assert "CANCELLED" in text
+    assert "In progress" not in text  # empty groups are omitted, not shown empty
+
+
+async def test_status_command_escapes_markdown_for_a_task_with_no_description(
+    patch_bot_api, session
+):
+    task = await create_task(session, task_type="bug_fix", task_context={})
+    for state in (
+        TaskState.TRIAGING,
+        TaskState.INVESTIGATING,
+        TaskState.PLANNING_FIX,
+        TaskState.CODING,
+        TaskState.TESTING,
+        TaskState.REVIEWING,
+        TaskState.PR_CREATION,
+        TaskState.WAITING_FOR_APPROVAL,
+    ):
+        await transition(session, task, state)
+
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    text = _reply_texts(update)[0]
+    # Regression test for a real live bug: an earlier version emitted a
+    # literal, un-escaped "(no description)" -- MarkdownV2 rejects a
+    # bare '(', so Telegram's sendMessage call itself failed with a 400
+    # and the message never arrived at all (silence, not a bad render).
+    assert "(no description)" not in text
+    assert "no description" in text
+    kwargs = update.message.reply_text.call_args.kwargs
+    assert kwargs.get("parse_mode") == bot_module.ParseMode.MARKDOWN_V2
+
+
+async def test_status_command_escapes_the_overflow_line_past_the_cap(patch_bot_api, session):
+    for _ in range(12):
+        task = await create_task(session, task_type="bug_fix", task_context={})
+        await transition(session, task, TaskState.TRIAGING)
+
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    text = _reply_texts(update)[0]
+    # "..." is three literal '.' characters -- also MarkdownV2-reserved,
+    # same class of bug as the no-description case above.
+    assert bot_module._escape_markdown_v2("...and 2 more") in text
+
+
+async def test_status_command_shows_a_description_for_waiting_for_approval_tasks(
+    patch_bot_api, session
+):
+    task = await create_task(
+        session,
+        task_type="bug_fix",
+        task_context={"prompt": "the login page 500s when submitting"},
+    )
+    await transition(session, task, TaskState.TRIAGING)
+    await transition(session, task, TaskState.INVESTIGATING)
+    await transition(session, task, TaskState.PLANNING_FIX)
+    await transition(session, task, TaskState.CODING)
+    await transition(session, task, TaskState.TESTING)
+    await transition(session, task, TaskState.REVIEWING)
+    await transition(session, task, TaskState.PR_CREATION)
+    await transition(session, task, TaskState.WAITING_FOR_APPROVAL)
+
+    update = _fake_update(user_id=42)
+    await bot_module.status_command(update, _fake_context())
+
+    text = _reply_texts(update)[0]
+    assert "Waiting for your approval" in text
+    assert "the login page 500s when submitting" in text
+
+
+# --- /ask ------------------------------------------------------------------
+
+
+async def test_ask_command_creates_a_real_task(patch_bot_api, session):
+    update = _fake_update(user_id=42)
+    context = _fake_context(args=["the", "checkout", "page", "500s", "on", "submit"])
+
+    await bot_module.ask_command(update, context)
+
+    text = _reply_texts(update)[0]
+    assert "bug_fix" in text
+    rows = (await session.execute(select(Task))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].task_context["prompt"] == "the checkout page 500s on submit"
+
+
+async def test_ask_command_asks_for_clarification_instead_of_guessing(
+    patch_bot_api, session
+):
+    update = _fake_update(user_id=42)
+    context = _fake_context(args=["please", "help"])
+
+    await bot_module.ask_command(update, context)
+
+    assert "not sure" in _reply_texts(update)[0].lower()
+    rows = (await session.execute(select(Task))).scalars().all()
+    assert rows == []  # no guessed task created
+
+
+async def test_ask_command_rejects_an_unlisted_user(patch_bot_api, session):
+    update = _fake_update(user_id=999)
+    context = _fake_context(args=["fix", "the", "thing"])
+
+    await bot_module.ask_command(update, context)
+
+    assert "not authorized" in _reply_texts(update)[0].lower()
+    rows = (await session.execute(select(Task))).scalars().all()
+    assert rows == []
+
+
+# --- /approve, /reject -------------------------------------------------
+
+
+async def test_approve_command_drives_a_real_transition(patch_bot_api, session):
+    task = await create_task(session, task_type="bug_fix", task_context={})
+    for state in _APPROVE_PATH:
+        await transition(session, task, state)
+
+    update = _fake_update(user_id=42)
+    context = _fake_context(args=[str(task.id)])
+    await bot_module.approve_command(update, context)
+
+    assert "MERGED" in _reply_texts(update)[0]
+    await session.refresh(task)
+    assert task.state == "MERGED"
+
+
+async def test_reject_command_drives_a_real_transition(patch_bot_api, session):
+    task = await create_task(session, task_type="bug_fix", task_context={})
+    for state in _APPROVE_PATH:
+        await transition(session, task, state)
+
+    update = _fake_update(user_id=42)
+    context = _fake_context(args=[str(task.id)])
+    await bot_module.reject_command(update, context)
+
+    assert "CANCELLED" in _reply_texts(update)[0]
+
+
+async def test_approve_command_on_wrong_state_replies_clearly(patch_bot_api, session):
+    task = await create_task(session, task_type="bug_fix", task_context={})  # CREATED
+    update = _fake_update(user_id=42)
+    context = _fake_context(args=[str(task.id)])
+
+    await bot_module.approve_command(update, context)
+
+    assert "can't approve" in _reply_texts(update)[0].lower()
+
+
+async def test_approve_command_with_no_task_id_shows_usage(patch_bot_api):
+    update = _fake_update(user_id=42)
+    await bot_module.approve_command(update, _fake_context(args=[]))
+    assert "usage" in _reply_texts(update)[0].lower()
+
+
+# --- /report -- formatting only, no real Ollama call in the default suite --
+
+
+async def test_report_command_formats_a_successful_report(monkeypatch, patch_bot_api):
+    fake_response = httpx.Response(
+        200,
+        json={
+            "period_start": "2026-01-01T00:00:00+00:00",
+            "period_end": "2026-01-08T00:00:00+00:00",
+            "tasks_resolved": 3,
+            "prs_opened": 1,
+            "prs_merged": 0,
+            "dependencies_updated": 2,
+            "top_issues": ["the checkout bug recurred", "CSV export still drops rows"],
+        },
+    )
+
+    async def _fake_post(path, json=None):
+        assert path == "/reports"
+        return fake_response
+
+    monkeypatch.setattr(bot_module, "_api_post", _fake_post)
+
+    update = _fake_update(user_id=42)
+    await bot_module.report_command(update, _fake_context())
+
+    texts = _reply_texts(update)
+    assert any("checkout bug recurred" in t for t in texts)
+    assert any("CSV export" in t for t in texts)
+
+
+async def test_report_command_rejects_an_unlisted_user(patch_bot_api):
+    update = _fake_update(user_id=999)
+    await bot_module.report_command(update, _fake_context())
+    assert "not authorized" in _reply_texts(update)[0].lower()
+
+
+# --- proactive notifications ------------------------------------------
+
+
+async def test_notify_job_does_not_spam_tasks_already_waiting_at_startup(
+    patch_bot_api, session
+):
+    """The priming tick must never treat everything already sitting in
+    WAITING_FOR_APPROVAL/FAILED as a fresh arrival."""
+    existing = await create_task(session, task_type="bug_fix", task_context={})
+    for state in _APPROVE_PATH:
+        await transition(session, existing, state)
+
+    context = _fake_context()
+    await bot_module._notify_job(context)
+
+    context.bot.send_message.assert_not_called()
+
+
+async def test_notify_job_notifies_only_on_new_arrivals(patch_bot_api, session):
+    context = _fake_context()
+    await bot_module._notify_job(context)  # primes on an empty DB
+
+    new_task = await create_task(session, task_type="bug_fix", task_context={})
+    for state in _APPROVE_PATH:
+        await transition(session, new_task, state)
+
+    await bot_module._notify_job(context)
+
+    context.bot.send_message.assert_called_once()
+    kwargs = context.bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == 42
+    assert str(new_task.id)[:8] in kwargs["text"]
