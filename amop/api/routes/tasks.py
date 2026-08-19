@@ -14,7 +14,13 @@ from amop.api.errors import api_error
 from amop.api.schemas import DiffOut, TaskCreate, TaskOut, TaskTransitionOut
 from amop.database.models import Repository, Task
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
-from amop.orchestrator.task import create_task, get_task, get_transitions, transition
+from amop.orchestrator.task import (
+    ConcurrentUpdateError,
+    create_task,
+    get_task,
+    get_transitions,
+    transition,
+)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -39,6 +45,13 @@ async def _transition_or_409(
         return await transition(session, task, to_state, actor=actor, trigger=trigger)
     except IllegalTransitionError as exc:
         raise api_error(409, "ILLEGAL_TRANSITION", str(exc))
+    except ConcurrentUpdateError as exc:
+        # Milestone 16 / Section 4.3.1. Deliberately NOT retried here:
+        # a 409 tells the caller their view of the task was stale, and
+        # for a human clicking Approve the honest answer is "someone
+        # else just changed this, look again" -- not a silent retry that
+        # applies their click to a task they never actually saw.
+        raise api_error(409, "CONCURRENT_UPDATE", str(exc))
 
 
 @router.post(

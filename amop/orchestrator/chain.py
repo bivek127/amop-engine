@@ -50,7 +50,7 @@ from amop.codebase_intel.indexer import index_repo
 from amop.database.models import PullRequest, Task
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
-from amop.orchestrator.task import transition
+from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
 from amop.sandbox import repo as git_repo
@@ -335,8 +335,7 @@ class ChainAgents:
             tester=TesterAgent(model, ctx),
             reviewer=ReviewerAgent(model, ctx),
         )
-
-
+        
 @dataclass
 class ChainResult:
     task: Task
@@ -411,7 +410,16 @@ async def run_chain(
 
     async def go(to_state: TaskState, actor: str, trigger: str | None = None) -> None:
         nonlocal task
-        task = await transition(session, task, to_state, trigger=trigger, actor=actor)
+        # transition_with_retry, not transition: the chain holds this
+        # Task object for the whole run (minutes), and since Milestone 15
+        # a human can approve/reject the same row from the API, Telegram
+        # or the dashboard mid-flight. On conflict this re-reads and
+        # re-validates against the fresh state -- so a human-issued
+        # CANCELLED surfaces as IllegalTransitionError here instead of
+        # being silently overwritten.
+        task = await transition_with_retry(
+            session, task, to_state, trigger=trigger, actor=actor
+        )
         result.task = task
         result.final_state = to_state
 

@@ -49,6 +49,19 @@ class Task(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Section 4.3.1's OCC primitive, Milestone 16. SQLAlchemy's own
+    # version_id_col emits exactly the statement the spec specifies --
+    # UPDATE tasks SET ..., version = version + 1 WHERE id = ? AND
+    # version = ? -- and raises StaleDataError when zero rows match.
+    #
+    # Declared on the mapper rather than hand-written into transition()
+    # deliberately: this way EVERY write to a Task row is guarded, not
+    # just the one function someone remembered to protect. chain.py and
+    # cli/main.py both assign task.task_context after a run and commit;
+    # those are lost-update candidates too, and they are covered here
+    # without either file changing.
+    __mapper_args__ = {"version_id_col": version}
+
 
 class TaskTransition(Base):
     """Spec Section 14.2's `task_transitions` table — the append-only
