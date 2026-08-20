@@ -17,9 +17,10 @@ Deviation from Section 12.2's literal pseudocode, and why:
     any tool carrying a path argument -- everything else matches Section
     12.2's structure and ordering exactly.
 
-Also out of scope this milestone (see CLAUDE.md's "What NOT to Build"):
-protected_path_match() (Section 12.2.1) and prompt-injection input
-tagging (12.2.2) -- both explicitly deferred.
+Milestone 19: protected_path_match() (Section 12.2.1) is wired in below
+-- previously deferred, now built (safety/protected_paths.py). Prompt-
+injection input tagging (12.2.2) is a separate, complementary layer;
+see safety/untrusted_input.py.
 """
 
 from dataclasses import dataclass
@@ -151,5 +152,14 @@ def evaluate(agent: str, tool: ToolSpec, args: dict, ctx: ToolContext) -> Decisi
         return Decision.deny("merge_requires_operator")
     if blacklist_match(tool, args):
         return Decision.deny("blacklisted_command")
+
+    # Local import: protected_paths.py imports resolve_within_scratch
+    # FROM this module, so a top-level import here would be circular.
+    # Deferred import breaks the cycle without restructuring either
+    # module -- proportionate for one small, additive check.
+    from amop.safety.protected_paths import protected_path_match
+
+    if protected_path_match(tool, args, ctx):
+        return Decision.deny("protected_infrastructure_path")
 
     return Decision.allow_()

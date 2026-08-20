@@ -60,6 +60,7 @@ from amop.orchestrator.concurrency import (
 from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
+from amop.safety.untrusted_input import wrap_untrusted
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
@@ -868,8 +869,15 @@ def _retag(handoff, task_id: str):
 
 def _investigator_prompt(description: str, relevant_memory: str = "") -> str:
     memory_block = f"\n\n{relevant_memory}" if relevant_memory else ""
+    # Section 12.2.2 / D-13: `description` is externally-sourced in the
+    # general case -- a Watcher-summarized GitHub issue, or a human-typed
+    # report via CLI/API/Telegram that the orchestrator itself didn't
+    # author -- so it gets the same untrusted boundary Watcher's own
+    # prompt uses (cli/main.py's _build_watcher_prompt), not a second,
+    # differently-worded convention.
+    wrapped = wrap_untrusted(description, source="bug_report")
     return (
-        f"Bug report: {description}{memory_block}\n\n"
+        f"Bug report: {wrapped}{memory_block}\n\n"
         "The repository is checked out at /workspace. Investigate and "
         "report the root cause."
     )

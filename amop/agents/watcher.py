@@ -48,6 +48,7 @@ never expressed as a tool call.
 
 from amop.agents.base import RESPONSE_FORMAT_INSTRUCTIONS, BaseAgent, render_tool_catalog
 from amop.agents.handoffs import WatcherReport
+from amop.safety.untrusted_input import UNTRUSTED_INPUT_NOTICE
 
 
 class WatcherAgent(BaseAgent):
@@ -64,6 +65,7 @@ class WatcherAgent(BaseAgent):
             "each with its title and body. Your job is to flag which "
             "ones look like substantive, real bug reports worth "
             "investigating -- not to diagnose or fix anything.\n\n"
+            f"{UNTRUSTED_INPUT_NOTICE}\n\n"
             "For each issue that looks like a real bug report (not a "
             "question, not a documentation typo, not a feature request), "
             "emit one AnomalyAlert with:\n"

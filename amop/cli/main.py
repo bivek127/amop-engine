@@ -22,6 +22,7 @@ from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
 from amop.orchestrator.watch import find_existing_task_for_issue, triage_anomaly
 from amop.safety import circuit_breakers
+from amop.safety.untrusted_input import wrap_untrusted
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.tools import github as github_tools  # noqa: F401 -- registers list_open_issues
 from amop.tools.registry import ToolContext, invoke_tool
@@ -301,7 +302,15 @@ def _build_watcher_prompt(candidates: list[dict]) -> str:
     lines = ["Open issues to classify:\n"]
     for i, issue in enumerate(candidates, start=1):
         lines.append(f"Issue {i} (#{issue['number']}): {issue['title']}")
-        lines.append(issue["body"][:2000] or "(no body)")
+        # Section 12.2.2 / D-13: the issue body is raw, externally-authored
+        # text (GitHub, not this operator) -- wrapped so it's structurally
+        # distinguished from trusted instructions before it ever reaches
+        # the model. A mitigation, not a guarantee (see
+        # safety/untrusted_input.py's own docstring) -- the actual
+        # enforcement is protected_paths.py's mechanical block, which
+        # holds even if this framing fails to convince the model.
+        body = issue["body"][:2000] or "(no body)"
+        lines.append(wrap_untrusted(body, source="github_issue"))
         lines.append("")
     return "\n".join(lines)
 
