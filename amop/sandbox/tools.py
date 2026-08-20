@@ -19,6 +19,7 @@ with.
 import asyncio
 import json
 import os
+import re
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -346,13 +347,27 @@ def _normalize_diff_headers(diff: str, relative_path: str) -> str:
     """Rewrite (or synthesize) the `--- `/`+++ ` header lines so the diff
     unambiguously targets `relative_path`, regardless of what the model
     wrote there -- paired with `git apply -p1` in patch_file(). This only
-    ever touches those two header lines, never the hunk bodies: the
-    actual patch application, and therefore all real conflict detection,
-    is still 100% git apply's job, not reimplemented here. Removes a
-    whole class of spurious failures (a local model getting a path
-    prefix wrong, or omitting headers entirely) that have nothing to do
-    with whether the diff's *content* is stale.
+    ever touches those two header lines and trailing whitespace, never
+    the hunk bodies: the actual patch application, and therefore all
+    real conflict detection, is still 100% git apply's job, not
+    reimplemented here. Removes a whole class of spurious failures (a
+    local model getting a path prefix wrong, or omitting headers
+    entirely) that have nothing to do with whether the diff's *content*
+    is stale.
+
+    Milestone 17: also ensures a trailing newline. Found live, then
+    confirmed by direct `git apply --check` reproduction against the
+    real historical diffs: qwen2.5-coder:14b's raw output consistently
+    omits the newline after the diff's last line, which `git apply`
+    rejects outright as "corrupt patch at line N" -- a pure format
+    defect, unrelated to whether the patch's content is otherwise
+    correct. Confirmed harmless to add for a diff that already ends in
+    one (splitlines/join round-trips it unchanged), and confirmed
+    sufficient on its own for a diff with no other defect (one of three
+    recovered failures applied cleanly once only this was fixed).
     """
+    if diff and not diff.endswith("\n"):
+        diff += "\n"
     old_header = f"--- a/{relative_path}\n"
     new_header = f"+++ b/{relative_path}\n"
     lines = diff.splitlines(keepends=True)
@@ -379,6 +394,59 @@ def _normalize_diff_headers(diff: str, relative_path: str) -> str:
         else:
             out.append(line)
     return "".join(out)
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+
+def _diagnose_context_mismatch(diff: str, current_content: str) -> str | None:
+    """After git apply has ALREADY rejected a diff, look for the specific
+    reason and describe it precisely -- never used to decide accept/
+    reject, only to explain a rejection git apply already made (that
+    decision stays 100% git apply's, same boundary
+    `_normalize_diff_headers` documents).
+
+    Milestone 17: found live, then confirmed by direct reproduction --
+    two of three recovered PATCH_CONFLICT diffs listed a line as
+    unchanged *context* whose text didn't match the file's real current
+    content (specifically: text matching what an EARLIER, also-rejected
+    attempt in the same retry loop would have produced, had it landed).
+    `git apply`'s own message for this ("patch does not apply") doesn't
+    say which line or what's actually there, so a retrying agent has to
+    guess. This walks the same line-accounting git apply does and
+    reports the first mismatch directly: the line number, what the diff
+    assumed, and what the file actually contains right now.
+    """
+    real_lines = current_content.splitlines()
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _HUNK_HEADER_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        old_line_no = int(m.group(1))
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@@ "):
+            line = lines[i]
+            i += 1
+            if not line or line[0] not in " -":
+                continue  # '+' lines and stray header/blank lines don't consume an old-file line
+            expected = line[1:]
+            actual = real_lines[old_line_no - 1] if 0 <= old_line_no - 1 < len(real_lines) else None
+            if actual is not None and actual != expected:
+                claim = "unchanged context" if line[0] == " " else "a line to remove"
+                return (
+                    f"line {old_line_no} of the diff assumes (as {claim}): "
+                    f"{expected!r} -- but the file's real current line "
+                    f"{old_line_no} is: {actual!r}. This diff looks like it "
+                    "was built against an intended future version of the "
+                    "file, not what's actually there -- re-read this exact "
+                    "region fresh and construct a new diff against it, "
+                    "rather than adjusting the same one again."
+                )
+            old_line_no += 1
+    return None
 
 
 @tool(
@@ -430,7 +498,7 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
     relative_path = container_path.removeprefix("/workspace/")
 
     try:
-        await asyncio.to_thread(ctx.sandbox.read_file, container_path)
+        current_content = await asyncio.to_thread(ctx.sandbox.read_file, container_path)
     except FileNotFoundError:
         return ToolResult(
             success=False,
@@ -442,6 +510,15 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
 
     normalized = _normalize_diff_headers(diff, relative_path)
     patch_path = f"/tmp/amop-patch-{uuid.uuid4().hex}.diff"
+
+    def _conflict_message(stderr: str, stdout: str) -> str:
+        base = (stderr or stdout or "diff did not apply cleanly").strip()
+        # Milestone 17: append a precise explanation when one is findable,
+        # rather than leaving the agent to guess from git's own message
+        # (which never names a line or shows real content).
+        detail = _diagnose_context_mismatch(normalized, current_content)
+        return f"{base}\n{detail}" if detail else base
+
     try:
         await asyncio.to_thread(ctx.sandbox.write_file, patch_path, normalized)
 
@@ -452,7 +529,7 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
             return ToolResult(
                 success=False,
                 error_code="PATCH_CONFLICT",
-                message=(check.stderr or check.stdout or "diff did not apply cleanly").strip(),
+                message=_conflict_message(check.stderr, check.stdout),
             )
 
         applied = await asyncio.to_thread(
@@ -462,9 +539,7 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
             return ToolResult(
                 success=False,
                 error_code="PATCH_CONFLICT",
-                message=(
-                    applied.stderr or applied.stdout or "diff did not apply cleanly"
-                ).strip(),
+                message=_conflict_message(applied.stderr, applied.stdout),
             )
     except Exception as exc:
         return ToolResult(success=False, error_code="PATCH_ERROR", message=str(exc))
