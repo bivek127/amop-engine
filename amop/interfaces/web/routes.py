@@ -11,6 +11,7 @@ feed, cost/trend charts.
 """
 
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -41,6 +42,56 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 # a browser's extra screen room doesn't need.
 _GROUP_ORDER = list(TaskState)
 _TASKS_PER_GROUP_CAP = 25
+
+# Milestone 18: a badge color per state, matching base.html's token
+# names exactly (amber/red/green/blue/gray) -- one source of "what color
+# is this state" shared by every template rather than each re-deciding.
+# Same semantic-color-separate-from-accent split Telegram's /status
+# reformat (Milestone 15) used, now applied visually instead of by emoji.
+STATE_COLOR: dict[str, str] = {
+    "WAITING_FOR_APPROVAL": "amber",
+    "FAILED": "red",
+    "CANCELLED": "gray",
+    "MERGED_INTO_EXISTING": "gray",
+    "NEEDS_HUMAN_INPUT": "amber",
+    "MERGED": "green",
+    "RESOLVED": "green",
+}
+
+
+def _state_color(state: str) -> str:
+    return STATE_COLOR.get(state, "blue")  # everything else is "in progress"
+
+
+def _relative_time(value: datetime | None) -> str:
+    if value is None:
+        return "—"
+    now = datetime.now(UTC)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    delta = now - value
+    seconds = int(delta.total_seconds())
+    if seconds < 5:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 30:
+        return f"{days}d ago"
+    months = days // 30
+    if months < 12:
+        return f"{months}mo ago"
+    return f"{days // 365}y ago"
+
+
+templates.env.filters["relative_time"] = _relative_time
+templates.env.filters["state_color"] = _state_color
 
 
 @router.get("/login", response_class=HTMLResponse)

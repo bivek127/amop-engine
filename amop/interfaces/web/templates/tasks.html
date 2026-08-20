@@ -1,21 +1,136 @@
 {% extends "base.html" %}
 {% block title %}Tasks — AMOP{% endblock %}
+{% block head %}
+<style>
+  .list-header {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    margin-bottom: 1.5rem; gap: 1rem; flex-wrap: wrap;
+  }
+  .search-box { position: relative; width: 280px; max-width: 100%; }
+  .search-box input {
+    width: 100%; padding-left: 2.1rem; background: var(--surface);
+  }
+  .search-box .icon {
+    position: absolute; left: .7rem; top: 50%; transform: translateY(-50%);
+    color: var(--text-faint); font-size: .85rem; pointer-events: none;
+  }
+
+  details.group { margin-bottom: .5rem; }
+  details.group + details.group { margin-top: .5rem; }
+  summary.group-summary {
+    list-style: none; cursor: pointer; display: flex; align-items: center;
+    gap: .6rem; padding: .6rem .2rem; user-select: none;
+  }
+  summary.group-summary::-webkit-details-marker { display: none; }
+  summary.group-summary .chevron {
+    display: inline-block; transition: transform .15s ease; color: var(--text-faint);
+    font-size: .7rem; width: 1rem;
+  }
+  details[open] > summary.group-summary .chevron { transform: rotate(90deg); }
+  summary.group-summary .group-name {
+    font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
+  }
+  summary.group-summary .group-count {
+    color: var(--text-faint); font-size: .8rem; font-weight: 600;
+  }
+  .cards { display: flex; flex-direction: column; gap: .5rem; padding: .25rem 0 .5rem; }
+
+  .task-card {
+    display: grid; grid-template-columns: 4px 1fr auto; align-items: stretch;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; transition: border-color .12s ease, transform .12s ease;
+  }
+  .task-card:hover { border-color: var(--text-faint); }
+  .task-card .stripe.amber { background: var(--amber); }
+  .task-card .stripe.red { background: var(--red); }
+  .task-card .stripe.green { background: var(--green); }
+  .task-card .stripe.blue { background: var(--blue); }
+  .task-card .stripe.gray { background: var(--gray); }
+  .task-card-body { padding: .85rem 1rem; min-width: 0; }
+  .task-card-top { display: flex; align-items: center; gap: .6rem; margin-bottom: .3rem; }
+  .task-type-label {
+    font-weight: 700; font-size: .86rem; text-transform: capitalize;
+  }
+  .task-id { color: var(--text-faint); font-size: .78rem; }
+  .task-desc {
+    color: var(--text-muted); font-size: .87rem; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .task-card-meta {
+    display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
+    gap: .35rem; padding: .85rem 1.1rem; border-left: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .task-time { color: var(--text-faint); font-size: .76rem; }
+  .overflow-note { color: var(--text-faint); font-size: .82rem; padding: .35rem .2rem 1rem; }
+  .empty-state { color: var(--text-muted); padding: 2rem 0; }
+
+  .hidden-by-search { display: none !important; }
+</style>
+{% endblock %}
 {% block content %}
-<h1>Tasks</h1>
+<div class="list-header">
+  <div>
+    <h1>Tasks</h1>
+    <p class="page-sub">Every task AMOP has run or is running, grouped by state.</p>
+  </div>
+  <div class="search-box">
+    <span class="icon">&#9906;</span>
+    <input id="task-search" type="search" placeholder="Search by type or description&hellip;" autocomplete="off">
+  </div>
+</div>
+
 {% if not groups %}
-  <p>No tasks yet.</p>
+  <p class="empty-state">No tasks yet — <a href="/web/submit" style="color:var(--accent)">submit one</a> to get started.</p>
 {% endif %}
+
 {% for group in groups %}
-  <div class="group-header">{{ group.state }} ({{ group.count }})</div>
-  {% for task in group.tasks %}
-    <div class="task-row">
-      <span class="task-id"><a href="/web/tasks/{{ task.id }}">{{ task.id|string|truncate(8, True, '') }}</a></span>
-      <span class="task-type">{{ task.task_type }}</span>
-      <span class="task-desc">{{ (task.task_context or {}).get('prompt') or '' }}</span>
+  <details class="group" open data-group>
+    <summary class="group-summary">
+      <span class="chevron">&#9656;</span>
+      <span class="badge {{ group.state | state_color }}"><span class="dot"></span>{{ group.state.replace('_', ' ') }}</span>
+      <span class="group-count">{{ group.count }}</span>
+    </summary>
+    <div class="cards">
+      {% for task in group.tasks %}
+        <a class="task-card" href="/web/tasks/{{ task.id }}" data-search="{{ task.task_type }} {{ (task.task_context or {}).get('prompt') or '' }}">
+          <span class="stripe {{ group.state | state_color }}"></span>
+          <div class="task-card-body">
+            <div class="task-card-top">
+              <span class="task-type-label">{{ task.task_type.replace('_', ' ') }}</span>
+              <span class="task-id mono">{{ task.id | string | truncate(8, True, '') }}</span>
+            </div>
+            <div class="task-desc">{{ (task.task_context or {}).get('prompt') or 'No description' }}</div>
+          </div>
+          <div class="task-card-meta">
+            <span class="task-time mono">{{ task.created_at | relative_time }}</span>
+          </div>
+        </a>
+      {% endfor %}
+      {% if group.overflow > 0 %}
+        <div class="overflow-note">&hellip;and {{ group.overflow }} more</div>
+      {% endif %}
     </div>
-  {% endfor %}
-  {% if group.overflow > 0 %}
-    <div class="overflow-note">...and {{ group.overflow }} more</div>
-  {% endif %}
+  </details>
 {% endfor %}
+
+<script>
+  const searchInput = document.getElementById("task-search");
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      const q = searchInput.value.trim().toLowerCase();
+      document.querySelectorAll("[data-group]").forEach((group) => {
+        let visibleCount = 0;
+        group.querySelectorAll(".task-card").forEach((card) => {
+          const haystack = (card.dataset.search || "").toLowerCase();
+          const match = !q || haystack.includes(q);
+          card.classList.toggle("hidden-by-search", !match);
+          if (match) visibleCount += 1;
+        });
+        group.classList.toggle("hidden-by-search", q.length > 0 && visibleCount === 0);
+        if (q) group.open = visibleCount > 0;
+      });
+    });
+  }
+</script>
 {% endblock %}
