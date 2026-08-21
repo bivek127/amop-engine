@@ -272,8 +272,11 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
 @app.command()
 @click.option(
     "--repo",
-    required=True,
-    help="GitHub repo to poll, as owner/repo (e.g. bivek127/amop-watcher-sandbox).",
+    default=None,
+    help=(
+        "GitHub repo to poll, as owner/repo. Omit to poll every registered "
+        "repo whose index_status is 'ready' (Milestone 20)."
+    ),
 )
 @click.option(
     "--local-path",
@@ -291,7 +294,7 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
 @click.option(
     "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
 )
-def watch(repo: str, local_path: str | None, interval: int, model: str) -> None:
+def watch(repo: str | None, local_path: str | None, interval: int, model: str) -> None:
     """Poll a GitHub repo's open issues on an interval, dedupe against
     existing tasks, and create real bug_fix Tasks for qualifying
     anomalies (Section 6.1)."""
@@ -315,26 +318,85 @@ def _build_watcher_prompt(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _watch(repo: str, local_path: Path | None, interval: int, model: str) -> None:
+async def _watch_targets(session_factory) -> list[tuple[str, Path | None]]:
+    """Every registered repo that's ready to watch, as (slug, local_path).
+
+    `index_status == 'ready'` is the gate per Section 7.1: an unindexed
+    or mid-index repo has no trustworthy RAG index, and the chain a
+    qualifying anomaly would hand off to depends on one.
+
+    A repo with no `url` is skipped rather than guessed at -- watching
+    needs a GitHub slug, and `repo_path` is a local directory, not a
+    slug. This is the path-vs-slug identity split the Repository model's
+    own comment describes; inferring one from the other would be a guess
+    dressed up as a default.
+    """
+    from amop.database.models import Repository
+
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(Repository)
+                    .where(Repository.index_status == "ready")
+                    .order_by(Repository.created_at)
+                )
+            ).scalars().all()
+        )
+    return [(r.url, Path(r.repo_path)) for r in rows if r.url]
+
+
+async def _watch(
+    repo: str | None, local_path: Path | None, interval: int, model: str
+) -> None:
     engine = make_engine()
     session_factory = make_session_factory(engine)
     await init_db(engine)
     provider = OllamaProvider(model=model)
 
-    click.echo(f"Watching {repo} every {interval}s" + (f" (local: {local_path})" if local_path else " (detection/triage only -- no --local-path)"))
+    single_repo = repo is not None
+    if single_repo:
+        click.echo(
+            f"Watching {repo} every {interval}s"
+            + (f" (local: {local_path})" if local_path else " (detection/triage only -- no --local-path)")
+        )
+    else:
+        targets = await _watch_targets(session_factory)
+        if not targets:
+            click.echo(
+                "No registered repo is ready to watch. Register one with "
+                "`amop repos add <path> --url owner/name`, or pass --repo.",
+                err=True,
+            )
+            await engine.dispose()
+            sys.exit(1)
+        click.echo(f"Watching {len(targets)} registered repos every {interval}s:")
+        for slug, path in targets:
+            click.echo(f"  {slug}  (local: {path})")
     click.echo("Ctrl+C to stop.\n")
 
     try:
         while True:
-            try:
-                await _poll_once(session_factory, repo, local_path, provider)
-            except Exception as exc:
-                # Section 6.1's own failure-handling rule: a data-source
-                # read failure is logged and that source is skipped for
-                # the cycle -- Watcher never fails the whole cycle (and
-                # here, never kills the whole `watch` process) over one
-                # bad poll.
-                click.echo(f"  [poll cycle error, will retry next cycle] {exc}")
+            # Re-read the registry each cycle when watching all repos, so
+            # `amop repos add` takes effect without a restart -- the whole
+            # point of a central registry over a --repo flag.
+            cycle = (
+                [(repo, local_path)]
+                if single_repo
+                else await _watch_targets(session_factory)
+            )
+            for slug, path in cycle:
+                try:
+                    await _poll_once(session_factory, slug, path, provider)
+                except Exception as exc:
+                    # Section 6.1's own failure-handling rule: a data-source
+                    # read failure is logged and that source is skipped for
+                    # the cycle -- Watcher never fails the whole cycle (and
+                    # here, never kills the whole `watch` process) over one
+                    # bad poll. Per-repo since Milestone 20: one repo being
+                    # unreachable, rate-limited, or breaker-tripped must not
+                    # stop the others from being polled at all.
+                    click.echo(f"  [{slug}: poll cycle error, will retry next cycle] {exc}")
             await asyncio.sleep(interval)
     except KeyboardInterrupt:
         click.echo("\nStopped.")
@@ -851,6 +913,141 @@ def concurrency() -> None:
         click.echo(f"  {count}  {repo}")
     if not per_repo:
         click.echo("  (nothing running here)")
+
+
+@app.group()
+def repos() -> None:
+    """Manage the repository registry (Section 14.2)."""
+
+
+@repos.command("add")
+@click.argument("repo_path", type=click.Path(exists=True, file_okay=False))
+@click.option("--url", default=None, help="Canonical remote URL / owner-name slug.")
+@click.option("--name", "display_name", default=None, help="Human-readable label.")
+@click.option(
+    "--default-branch", default="main", show_default=True, help="Default branch."
+)
+@click.option(
+    "--index/--no-index",
+    default=True,
+    show_default=True,
+    help="Run the indexing pipeline (Section 7.1) after registering.",
+)
+def repos_add(
+    repo_path: str, url: str | None, display_name: str | None,
+    default_branch: str, index: bool,
+) -> None:
+    """Register a repo and (by default) index it."""
+    asyncio.run(_repos_add(repo_path, url, display_name, default_branch, index))
+
+
+async def _repos_add(
+    repo_path: str, url: str | None, display_name: str | None,
+    default_branch: str, index: bool,
+) -> None:
+    from amop.codebase_intel.indexer import index_repo
+    from amop.database.models import Repository
+    from amop.safety.permissions import normalize_repo_identity
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    # Stored canonical, matching Milestone 16's lock-key identity -- see
+    # safety/permissions.py::normalize_repo_identity for why both sides
+    # must agree.
+    resolved = normalize_repo_identity(repo_path)
+
+    async with session_factory() as session:
+        existing = (
+            await session.execute(
+                select(Repository).where(Repository.repo_path == resolved)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            click.echo(f"Already registered: {resolved} ({existing.index_status})")
+            row = existing
+        else:
+            row = Repository(
+                repo_path=resolved,
+                url=url,
+                display_name=display_name,
+                default_branch=default_branch,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            click.echo(f"Registered {resolved}")
+
+        if not index:
+            click.echo(f"index_status: {row.index_status} (indexing skipped)")
+            return
+
+        # index_status is written at each real step rather than only at
+        # the end, so a crash mid-index leaves an honest 'indexing' (a
+        # state Section 7.1 defines) instead of a stale 'ready' that
+        # would tell agents the RAG index is trustworthy when it isn't.
+        row.index_status = "indexing"
+        session.add(row)
+        await session.commit()
+        click.echo("Indexing...")
+        try:
+            count = await index_repo(session, resolved, Path(resolved))
+        except Exception as exc:  # noqa: BLE001 -- reported, never silently 'ready'
+            row.index_status = "stale"
+            session.add(row)
+            await session.commit()
+            click.echo(f"Indexing FAILED: {exc}", err=True)
+            click.echo("index_status: stale")
+            sys.exit(1)
+        row.index_status = "ready"
+        session.add(row)
+        await session.commit()
+        click.echo(f"Indexed {count} chunks -- index_status: ready")
+
+
+@repos.command("list")
+def repos_list() -> None:
+    """Show every registered repo and its index status."""
+    asyncio.run(_repos_list())
+
+
+async def _repos_list() -> None:
+    from amop.database.models import Repository
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(Repository).order_by(Repository.created_at)
+                )
+            ).scalars().all()
+        )
+
+    if not rows:
+        click.echo("No repositories registered. Add one with: amop repos add <path>")
+        return
+
+    click.echo(f"{len(rows)} registered:\n")
+    for row in rows:
+        click.echo(f"  {row.display_name or Path(row.repo_path).name}")
+        click.echo(f"    path:   {row.repo_path}")
+        if row.url:
+            click.echo(f"    url:    {row.url}")
+        click.echo(f"    branch: {row.default_branch}")
+        click.echo(f"    index:  {row.index_status}")
+        overrides = row.permission_overrides or {}
+        if overrides:
+            parts = []
+            if overrides.get("default"):
+                parts.append(f"repo={overrides['default']}")
+            for agent, mode in (overrides.get("agents") or {}).items():
+                parts.append(f"{agent}={mode}")
+            click.echo(f"    modes:  {', '.join(parts)}")
+        click.echo()
 
 
 @app.command("serve-telegram")

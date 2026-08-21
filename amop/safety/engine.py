@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from amop.safety.blacklist import is_blacklisted
+from amop.safety.permissions import resolve_mode_from
 from amop.tools.registry import ToolContext, ToolSpec
 
 # Tools that mutate the merge state and require operator+ mode. No such
@@ -50,10 +51,19 @@ class Decision:
 
 
 def resolve_mode(agent: str, ctx: ToolContext) -> str:
-    """Section 12.1's mode resolution. D-8's full global < per-repo <
-    per-agent-per-repo precedence chain is deferred -- this milestone
-    uses a single global mode, already resolved onto ctx."""
-    return ctx.mode
+    """Section 12.1's mode resolution, D-8's full three-level chain:
+    global default < per-repo override < per-agent-per-repo override.
+
+    Milestone 20: previously this returned ctx.mode unconditionally (D-8
+    was deferred). It still does exactly that whenever a repo has no
+    overrides -- which is every unregistered repo and every repo
+    registered without a policy -- so no existing call site changes
+    behavior. Stays pure and synchronous: the overrides were already
+    loaded onto ctx by whoever built it, precisely so this function (and
+    therefore evaluate()) keeps Section 12.2's "pure and unit-testable in
+    isolation" property. See safety/permissions.py.
+    """
+    return resolve_mode_from(agent, ctx.mode, ctx.permission_overrides)
 
 
 CONTAINER_MOUNT = "/workspace"
@@ -135,7 +145,7 @@ def blacklist_match(tool: ToolSpec, args: dict) -> bool:
 
 
 def evaluate(agent: str, tool: ToolSpec, args: dict, ctx: ToolContext) -> Decision:
-    mode = resolve_mode(agent, ctx)  # 12.1 precedence (deferred to global-only)
+    mode = resolve_mode(agent, ctx)  # 12.1 / D-8 precedence (Milestone 20)
 
     # See module docstring: this check is moved ahead of the mutating
     # short-circuit as a deliberate, documented deviation from 12.2's

@@ -36,6 +36,7 @@ from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
 from amop.tools.registry import ToolContext, invoke_tool
+from amop.safety.permissions import load_permission_overrides
 
 # Section 6.7: dependency_updater.max_files_for_auto_fix, default 3.
 DEFAULT_MAX_FILES_FOR_AUTO_FIX = 3
@@ -111,6 +112,10 @@ async def run_dependency_update(
             git_repo.create_branch, sandbox, f"amop/deps-{uuid.UUID(task_id).hex[:8]}"
         )
 
+        # Section 12.1 / D-8, loaded once (safety/permissions.py).
+        # This is the agent spec 12.1's own example singles out as the
+        # one a repo might make `autonomous` while the rest stays
+        # restricted, so per-agent precedence matters most right here.
         ctx = ToolContext(
             agent_name="dependency_updater",
             scratch_dir=scratch_dir,
@@ -118,6 +123,9 @@ async def run_dependency_update(
             sandbox=sandbox,
             repo_path=str(Path(repo_path).resolve()),
             db_session=session,
+            permission_overrides=await load_permission_overrides(
+                session, str(Path(repo_path).resolve())
+            ),
         )
 
         agent = DependencyUpdaterAgent(model, ctx)

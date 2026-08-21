@@ -63,6 +63,11 @@ class DiffOut(BaseModel):
 class RepositoryCreate(BaseModel):
     repo_path: str
     display_name: str | None = None
+    # Milestone 20 / spec 14.2. All optional so Milestone 15's existing
+    # two-field POST body stays valid unchanged.
+    url: str | None = None
+    default_branch: str | None = None
+    permission_overrides: dict[str, Any] | None = None
 
 
 class RepositoryOut(BaseModel):
@@ -71,7 +76,21 @@ class RepositoryOut(BaseModel):
     id: uuid.UUID
     repo_path: str
     display_name: str | None = None
+    url: str | None = None
+    default_branch: str = "main"
+    detected_stack: dict[str, Any] | None = None
+    index_status: str = "unindexed"
+    permission_overrides: dict[str, Any] | None = None
     created_at: datetime
+
+
+class RepositoryPermissionsUpdate(BaseModel):
+    """PATCH /repositories/{id}/permissions -- spec 15.2's own endpoint.
+    Shape per Section 12.1's worked example:
+        {"default": "observer", "agents": {"dependency_updater": "autonomous"}}
+    """
+
+    permission_overrides: dict[str, Any] | None = None
 
 
 class PullRequestOut(BaseModel):

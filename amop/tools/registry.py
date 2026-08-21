@@ -55,6 +55,14 @@ class ToolContext:
     repo_path: str | None = None
     db_session: Any = None
 
+    # Milestone 20 / Section 12.1 D-8: this repo's permission_overrides,
+    # resolved ONCE by whoever builds this context (see
+    # safety/permissions.py's module docstring for why it's loaded here
+    # and not inside the Safety Engine). None means "no per-repo policy"
+    # -- the global `mode` above applies unchanged, which is every
+    # pre-Milestone-20 call site's existing behavior.
+    permission_overrides: dict | None = None
+
 
 @dataclass
 class ToolResult:

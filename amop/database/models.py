@@ -209,6 +209,38 @@ class Repository(Base):
     )
     repo_path: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     display_name: Mapped[str | None] = mapped_column(Text)
+
+    # --- Milestone 20: spec 14.2's remaining columns -------------------
+    # All nullable/defaulted deliberately: every column here is additive,
+    # so rows written by Milestone 15 stay valid and every existing query
+    # keeps working untouched. `tasks.repo_id` (14.2's foreign key) is
+    # still NOT built -- see this class's docstring above for why, and
+    # Milestone 20's own reasoning: per-repo permission lookup resolves
+    # fine through `repo_path`, so the three-table migration buys nothing
+    # this milestone needs.
+    #
+    # `url` vs `repo_path` -- both, because they are genuinely different
+    # identities and this codebase uses both. Spec 14.2 has only `url`
+    # because it assumes AMOP clones the repo itself; AMOP as built works
+    # from a local checkout. Concretely, `task_context["repo"]` already
+    # holds a LOCAL PATH when a task comes from `amop fix`, but a GITHUB
+    # SLUG ("owner/name") when it comes from Watcher -- and the lock keys
+    # (orchestrator/concurrency.py) plus the RAG index
+    # (codebase_intel/indexer.py) both key on the resolved local path.
+    # So `repo_path` stays the working identity and the unique key;
+    # `url` is the canonical one you watch and open PRs against.
+    url: Mapped[str | None] = mapped_column(Text)
+    default_branch: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="main"
+    )
+    detected_stack: Mapped[dict | None] = mapped_column(JSONB)  # Section 6.3.4
+    index_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="unindexed"
+    )  # unindexed | indexing | ready | stale
+    # Section 12.1 / D-8. Shape (spec 12.1's own worked example):
+    #   {"default": "observer", "agents": {"dependency_updater": "autonomous"}}
+    permission_overrides: Mapped[dict | None] = mapped_column(JSONB)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

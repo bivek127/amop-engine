@@ -60,6 +60,7 @@ from amop.orchestrator.concurrency import (
 from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
+from amop.safety.permissions import load_permission_overrides
 from amop.safety.untrusted_input import wrap_untrusted
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
@@ -1302,6 +1303,9 @@ async def run_fix(
         chunk_count = await index_repo(session, resolved_repo_path, scratch_dir)
         emit(f"Indexed {chunk_count} code chunks from {resolved_repo_path}")
 
+        # Section 12.1 / D-8: loaded ONCE here, not inside the Safety
+        # Engine -- see safety/permissions.py for why the gate stays pure.
+        overrides = await load_permission_overrides(session, resolved_repo_path)
         ctx = ToolContext(
             agent_name="chain",
             scratch_dir=scratch_dir,
@@ -1309,6 +1313,7 @@ async def run_fix(
             sandbox=sandbox,
             repo_path=resolved_repo_path,
             db_session=session,
+            permission_overrides=overrides,
         )
         agents = ChainAgents.build(model, ctx, task_id)
         emit(f"Sandbox container: {sandbox.short_id}")

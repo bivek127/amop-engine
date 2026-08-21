@@ -39,6 +39,7 @@ from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.sandbox.manager import SandboxManager
 from amop.tools.registry import ToolContext, invoke_tool
+from amop.safety.permissions import load_permission_overrides
 
 # Section 6.6: optimizer.min_improvement_pct, default 10%.
 DEFAULT_MIN_IMPROVEMENT_PCT = 10.0
@@ -124,6 +125,7 @@ async def run_optimization(
         await asyncio.to_thread(
             git_repo.create_branch, sandbox, f"amop/opt-{uuid.UUID(task_id).hex[:8]}"
         )
+        # Section 12.1 / D-8, loaded once (safety/permissions.py).
         ctx = ToolContext(
             agent_name="optimizer",
             scratch_dir=scratch_dir,
@@ -131,6 +133,9 @@ async def run_optimization(
             sandbox=sandbox,
             repo_path=str(Path(repo_path).resolve()),
             db_session=session,
+            permission_overrides=await load_permission_overrides(
+                session, str(Path(repo_path).resolve())
+            ),
         )
 
         # --- baseline, before the agent touches anything ---------------
