@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from amop.api.deps import configure_session_factory
-from amop.api.routes import memory, pull_requests, reports, repositories, tasks
+from amop.api.routes import memory, pull_requests, reports, repositories, tasks, webhooks
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.interfaces.web.auth import WebAuthRequired
 from amop.interfaces.web.routes import router as web_router
@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(pull_requests.router)
     app.include_router(memory.router)
     app.include_router(reports.router)
+    app.include_router(webhooks.router)
     app.include_router(web_router)
 
     @app.exception_handler(WebAuthRequired)

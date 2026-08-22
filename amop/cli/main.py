@@ -933,17 +933,28 @@ def repos() -> None:
     show_default=True,
     help="Run the indexing pipeline (Section 7.1) after registering.",
 )
+@click.option(
+    "--webhook-secret",
+    default=None,
+    help=(
+        "Per-repo GitHub webhook secret (Milestone 21). Overrides the "
+        "global GITHUB_WEBHOOK_SECRET env var for this repo only. Also "
+        "updates the secret if the repo is already registered."
+    ),
+)
 def repos_add(
     repo_path: str, url: str | None, display_name: str | None,
-    default_branch: str, index: bool,
+    default_branch: str, index: bool, webhook_secret: str | None,
 ) -> None:
     """Register a repo and (by default) index it."""
-    asyncio.run(_repos_add(repo_path, url, display_name, default_branch, index))
+    asyncio.run(
+        _repos_add(repo_path, url, display_name, default_branch, index, webhook_secret)
+    )
 
 
 async def _repos_add(
     repo_path: str, url: str | None, display_name: str | None,
-    default_branch: str, index: bool,
+    default_branch: str, index: bool, webhook_secret: str | None = None,
 ) -> None:
     from amop.codebase_intel.indexer import index_repo
     from amop.database.models import Repository
@@ -967,12 +978,18 @@ async def _repos_add(
         if existing is not None:
             click.echo(f"Already registered: {resolved} ({existing.index_status})")
             row = existing
+            if webhook_secret is not None:
+                row.webhook_secret = webhook_secret
+                session.add(row)
+                await session.commit()
+                click.echo("  webhook secret updated")
         else:
             row = Repository(
                 repo_path=resolved,
                 url=url,
                 display_name=display_name,
                 default_branch=default_branch,
+                webhook_secret=webhook_secret,
             )
             session.add(row)
             await session.commit()

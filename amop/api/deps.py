@@ -29,3 +29,17 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         )
     async with _session_factory() as session:
         yield session
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """For code that isn't part of FastAPI's request-scoped dependency
+    cycle and so can't use `Depends(get_session)` -- Milestone 21's
+    webhook `BackgroundTasks` job is the first caller: it runs after the
+    HTTP response has already been returned, opening its own session
+    from the same factory every request handler shares.
+    """
+    if _session_factory is None:
+        raise RuntimeError(
+            "session factory not configured -- app startup (lifespan) did not run"
+        )
+    return _session_factory

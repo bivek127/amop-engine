@@ -241,7 +241,45 @@ class Repository(Base):
     #   {"default": "observer", "agents": {"dependency_updater": "autonomous"}}
     permission_overrides: Mapped[dict | None] = mapped_column(JSONB)
 
+    # Milestone 21 / spec 21's `github.webhook_secret_env`. Per-repo
+    # override of the global GITHUB_WEBHOOK_SECRET env var -- same
+    # global-default-with-per-entity-override shape D-8 already
+    # established for permission_overrides, reused rather than inventing
+    # a second precedence pattern. Never a default: a repo with neither
+    # this nor the env var set rejects webhook traffic outright (see
+    # api/routes/webhooks.py) rather than silently accepting unsigned
+    # requests.
+    webhook_secret: Mapped[str | None] = mapped_column(Text)
+
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ProcessedEvent(Base):
+    """Spec Section 4.3.2 / Design Decision D-17's `processed_events`
+    table -- consumer-side idempotency for at-least-once delivery.
+
+    Milestone 21's scope decision (CLAUDE.md, reaffirmed here, not
+    relitigated): the spec's original design puts this table downstream
+    of a Redis Streams consumer group. This project has deliberately not
+    built Redis (ADR-04/ADR-06). For a single-process receiver handling
+    webhook POSTs directly, this table alone provides the same guarantee
+    spec 4.3.2 describes -- a unique-constraint violation on retry means
+    "already handled," full stop -- without a queue in front of it.
+
+    `event_key` here is GitHub's own `X-GitHub-Delivery` header value
+    directly, not spec's `sha256(source + external_id + payload_digest)`
+    formula. Simplification, not a shortcut: GitHub already guarantees
+    that header is unique per delivery attempt, so hashing it (or
+    combining it with a payload digest) adds no additional collision
+    resistance -- it would just be hashing an already-unique value.
+    """
+
+    __tablename__ = "processed_events"
+
+    event_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
