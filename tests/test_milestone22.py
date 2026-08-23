@@ -45,7 +45,14 @@ async def engine():
     await init_db(eng)
     async with eng.begin() as conn:
         await conn.execute(
-            text("TRUNCATE task_transitions, tasks RESTART IDENTITY CASCADE")
+            # agent_actions included since Milestone 23: the hash chain
+            # now SPANS both tables, so a test asserting chain state has
+            # to control both. Leaving stray agent_actions rows here made
+            # every clean-chain assertion in this file fail.
+            text(
+                "TRUNCATE agent_actions, task_transitions, tasks "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     yield eng
     await eng.dispose()
@@ -265,7 +272,9 @@ async def test_a_deleted_row_breaks_the_chain(session):
     result = await verify_chain(session)
     assert not result.intact
     assert result.first_divergence_id == ids[3], "the row after the deletion diverges"
-    assert "broken or reordered" in result.reason
+    # Wording widened in Milestone 23 to name deletion explicitly, since
+    # that is the case this branch most often reports.
+    assert "broken, reordered, or rows were deleted" in result.reason
 
 
 # ---------------------------------------------------------------------
@@ -335,7 +344,8 @@ async def test_backfill_chains_pre_existing_unchained_rows(session, session_fact
     before = await verify_chain(session)
     assert before.unchained == 1
 
-    filled = await backfill_chain(session)
+    # Returns (newly_chained, legacy_positioned) since Milestone 23.
+    filled, _positioned = await backfill_chain(session)
     assert filled == 1
 
     session.expire_all()

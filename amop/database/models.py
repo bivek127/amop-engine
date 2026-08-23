@@ -104,6 +104,13 @@ class TaskTransition(Base):
     prev_hash: Mapped[str | None] = mapped_column(Text)
     row_hash: Mapped[str | None] = mapped_column(Text)
 
+    # Milestone 23: position in the SHARED chain that now spans this
+    # table and `agent_actions`. Per-table BIGSERIAL cannot order rows
+    # across two tables, so both draw from one `audit_chain_pos_seq`
+    # sequence, allocated inside the same advisory lock that already
+    # serializes appends -- see audit/chain.py.
+    chain_pos: Mapped[int | None] = mapped_column(BigInteger)
+
 
 class CodeChunk(Base):
     """Spec Section 14.2's `code_chunks` table, trimmed to Milestone 5's
@@ -277,6 +284,69 @@ class Repository(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class AgentAction(Base):
+    """Spec Section 14.2's `agent_actions` table — Milestone 23.
+
+    Section 12.6: every tool call, allowed or denied, writes one row
+    here. This is "the primary artifact for the adversarial testing
+    suite (Section 19.4) and for post-incident review of what an agent
+    actually attempted, not just what it was told to do."
+
+    Before this milestone that record lived in
+    `tasks.task_context["tool_calls"]`, a JSONB list wholly overwritten
+    on every write -- not append-only, not chainable, and the gap
+    Milestone 22 named as its top-priority unresolved item. This table
+    is now AUTHORITATIVE for audit; that JSONB survives only as a
+    denormalized cache for CLI display and must never be treated as the
+    audit record.
+
+    Hash-chained into the SAME chain as `task_transitions` (never a
+    second independent one) per Milestone 22's locked decision: with
+    separate chains, deleting every row of one table leaves an empty
+    chain that verifies as INTACT, which is worse than no verification
+    because it actively misleads.
+
+    `agent_run_id` carries NO ForeignKey despite spec 14.2 declaring one:
+    there is no `agent_runs` table in this codebase and never has been
+    (verified at Milestone 23 planning time). Same call, and same
+    reasoning, as MemoryItem.task_id -- a constraint pointing at a
+    nonexistent table would fail at CREATE, and inventing the table to
+    satisfy the FK is a different milestone's work. Nullable so it can be
+    populated if agent_runs is ever built, without a migration here.
+
+    `estimated_cost_usd` is likewise nullable and currently always NULL:
+    Section 11.3's cost tracking is not built. The column exists so
+    adding it later needs no schema change; it is not silently reporting
+    zero-cost.
+    """
+
+    __tablename__ = "agent_actions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    agent_name: Mapped[str | None] = mapped_column(Text)
+    tool_name: Mapped[str | None] = mapped_column(Text)
+    # Secrets redacted before persistence (safety/secret_scan.py's
+    # redact_secrets, reusing the same _BASELINE pattern set the pre-PR
+    # gate uses) -- Section 12.5.
+    arguments: Mapped[dict | None] = mapped_column(JSONB)
+    result: Mapped[str | None] = mapped_column(Text)
+    decision: Mapped[str | None] = mapped_column(Text)  # ALLOW | DENY
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Numeric)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Milestone 22/23's shared hash chain -- see TaskTransition and
+    # audit/chain.py.
+    prev_hash: Mapped[str | None] = mapped_column(Text)
+    row_hash: Mapped[str | None] = mapped_column(Text)
+    chain_pos: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class ProcessedEvent(Base):

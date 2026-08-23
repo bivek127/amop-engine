@@ -969,6 +969,42 @@ async def _audit_verify() -> None:
     sys.exit(1)
 
 
+@audit.command("actions")
+@click.option("--limit", default=20, show_default=True, help="Rows to show.")
+@click.option("--decision", default=None, help="Filter: ALLOW or DENY.")
+def audit_actions(limit: int, decision: str | None) -> None:
+    """Show recent Safety Engine decisions from the agent_actions trail."""
+    asyncio.run(_audit_actions(limit, decision))
+
+
+async def _audit_actions(limit: int, decision: str | None) -> None:
+    from amop.database.models import AgentAction
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+    async with session_factory() as session:
+        stmt = select(AgentAction).order_by(AgentAction.chain_pos.desc()).limit(limit)
+        if decision:
+            stmt = stmt.where(AgentAction.decision == decision.upper())
+        rows = list((await session.execute(stmt)).scalars().all())
+
+    if not rows:
+        click.echo("No agent_actions recorded yet.")
+        return
+
+    click.echo(f"{len(rows)} most recent (newest first):\n")
+    for row in rows:
+        marker = "DENY " if row.decision == "DENY" else "ALLOW"
+        click.echo(f"  [{marker}] {row.agent_name or '?'}.{row.tool_name or '?'}")
+        if row.decision_reason:
+            click.echo(f"          reason: {row.decision_reason}")
+        click.echo(
+            f"          chain_pos={row.chain_pos}  task={str(row.task_id)[:8] if row.task_id else '-'}"
+            f"  {row.timestamp:%Y-%m-%d %H:%M:%S}"
+        )
+
+
 @audit.command("backfill")
 def audit_backfill() -> None:
     """Hash-chain audit rows written before Milestone 22."""
@@ -982,10 +1018,17 @@ async def _audit_backfill() -> None:
     session_factory = make_session_factory(engine)
     await init_db(engine)
     async with session_factory() as session:
-        filled = await backfill_chain(session)
+        filled, positioned = await backfill_chain(session)
 
+    if positioned:
+        click.echo(
+            f"Assigned shared-chain positions to {positioned} pre-Milestone-23 "
+            "row(s). Their hashes were NOT recomputed -- position only, so the "
+            "existing chain is preserved exactly."
+        )
     if not filled:
-        click.echo("Nothing to backfill -- every audit row is already chained.")
+        if not positioned:
+            click.echo("Nothing to backfill -- every audit row is already chained.")
         return
     click.echo(f"Chained {filled} pre-existing row(s).")
     click.echo(

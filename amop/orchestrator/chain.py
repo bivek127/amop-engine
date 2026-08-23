@@ -1314,6 +1314,7 @@ async def run_fix(
             repo_path=resolved_repo_path,
             db_session=session,
             permission_overrides=overrides,
+            task_id=task.id,
         )
         agents = ChainAgents.build(model, ctx, task_id)
         emit(f"Sandbox container: {sandbox.short_id}")

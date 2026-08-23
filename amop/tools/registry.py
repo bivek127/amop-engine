@@ -6,11 +6,13 @@ Invocation pipeline (Section 8.1, every tool call, no exceptions):
     allowlist check (12.4) -> Sandbox executes (9) -> Registry normalizes
     result -> Audit log write (12.6) -> result returned to agent
 
-No sandbox this milestone (that's Milestone 3), so tools execute
-in-process directly. Audit logging this milestone is the returned
-ToolResult + the caller's tool_calls log (agents/coder.py, cli/main.py),
-not a persisted agent_actions row -- Section 12.6 isn't in this
-milestone's scope.
+Audit logging (Milestone 23, Section 12.6): every call that reaches a
+permission decision -- ALLOW or DENY -- writes a real, hash-chained
+`agent_actions` row via audit/actions.py's record_action(). That table
+is now AUTHORITATIVE for audit. The `tool_calls` list the callers still
+assemble (agents/base.py, cli/main.py) survives only as a denormalized
+cache for CLI display and must never be treated as the audit record --
+it is a JSONB blob that gets wholly overwritten on every write.
 
 A rejection at any gate short-circuits: the tool body never runs, and the
 caller gets a structured ToolResult(success=False, error_code=...,
@@ -18,6 +20,7 @@ message=...) -- never a silent no-op.
 """
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +57,13 @@ class ToolContext:
     sandbox: Any = None
     repo_path: str | None = None
     db_session: Any = None
+
+    # Milestone 23: which task this tool call belongs to, so its
+    # `agent_actions` audit row can be traced back (spec 14.2's
+    # agent_actions.task_id). Optional: plenty of legitimate call sites
+    # invoke tools outside any task, and an audit row with a NULL task_id
+    # is still a truthful record of an attempt.
+    task_id: Any = None
 
     # Milestone 20 / Section 12.1 D-8: this repo's permission_overrides,
     # resolved ONCE by whoever builds this context (see
@@ -159,6 +169,10 @@ async def invoke_tool(
     make it permissible. None means "no per-agent restriction" (the
     Milestone 2/3 call sites, unchanged).
     """
+    # Both imported lazily to avoid module-import cycles (safety.engine
+    # imports ToolSpec/ToolContext from here; audit.actions reaches
+    # database.models and orchestrator.concurrency).
+    from amop.audit.actions import record_action
     from amop.safety.engine import evaluate
 
     spec = get_tool(name)
@@ -168,7 +182,7 @@ async def invoke_tool(
         )
 
     if allowed_tools is not None and name not in allowed_tools:
-        return ToolResult(
+        refusal = ToolResult(
             success=False,
             error_code="TOOL_NOT_PERMITTED",
             message=(
@@ -176,6 +190,22 @@ async def invoke_tool(
                 f"(permitted: {sorted(allowed_tools)})"
             ),
         )
+        # Audited even though this is a registry-level refusal rather
+        # than a Safety Engine one (Milestone 23): Section 12.6 wants a
+        # record of "what an agent actually attempted", and an agent
+        # reaching for a tool outside its own allowlist is exactly that.
+        # UNKNOWN_TOOL/INVALID_ARGS below stay unaudited by contrast --
+        # a malformed call never expressed a coherent intent to act.
+        await record_action(
+            ctx,
+            agent_name=agent_name,
+            tool_name=name,
+            arguments=args,
+            decision="DENY",
+            decision_reason="tool_not_permitted",
+            result=refusal,
+        )
+        return refusal
 
     validation_error = _validate_args(spec, args)
     if validation_error:
@@ -185,8 +215,35 @@ async def invoke_tool(
 
     decision = evaluate(agent_name, spec, args, ctx)
     if not decision.allow:
-        return ToolResult(
+        refusal = ToolResult(
             success=False, error_code="DENIED", message=decision.reason
+        )
+        await record_action(
+            ctx,
+            agent_name=agent_name,
+            tool_name=name,
+            arguments=args,
+            decision="DENY",
+            decision_reason=decision.reason,
+            result=refusal,
+        )
+        return refusal
+
+    # Latency is measured around execution only -- not around the audit
+    # write or the permission check, which are this system's overhead
+    # rather than the tool's cost.
+    started = time.monotonic()
+
+    async def _audit_allowed(result: ToolResult) -> None:
+        await record_action(
+            ctx,
+            agent_name=agent_name,
+            tool_name=name,
+            arguments=args,
+            decision="ALLOW",
+            decision_reason=None,
+            result=result,
+            latency_ms=int((time.monotonic() - started) * 1000),
         )
 
     try:
@@ -194,12 +251,20 @@ async def invoke_tool(
             spec.func(**args, ctx=ctx), timeout=spec.timeout_seconds
         )
     except TimeoutError:
-        return ToolResult(
+        # The Safety Engine ALLOWED this call; it then timed out. Both
+        # facts belong in the record -- decision=ALLOW with a timeout
+        # result, not a DENY, because nothing refused it.
+        timed_out = ToolResult(
             success=False,
             error_code="TIMEOUT",
             message=f"{name} exceeded {spec.timeout_seconds}s",
         )
+        await _audit_allowed(timed_out)
+        return timed_out
     except Exception as exc:  # tool body raised -- normalize, never propagate
-        return ToolResult(success=False, error_code="TOOL_ERROR", message=str(exc))
+        errored = ToolResult(success=False, error_code="TOOL_ERROR", message=str(exc))
+        await _audit_allowed(errored)
+        return errored
 
+    await _audit_allowed(result)
     return result

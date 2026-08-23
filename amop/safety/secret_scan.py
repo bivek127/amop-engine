@@ -124,3 +124,60 @@ def scan_for_secrets(diff_text: str) -> list[SecretMatch]:
                     )
                 )
     return matches
+
+
+# ---------------------------------------------------------------------
+# Milestone 23: redaction for the agent_actions audit trail.
+# ---------------------------------------------------------------------
+
+REDACTED = "[REDACTED]"
+
+
+def redact_secrets(text: str) -> str:
+    """Replace anything matching the baseline secret patterns.
+
+    Reuses `_BASELINE` -- the SAME pattern set the pre-PR gate above
+    uses -- deliberately, rather than defining a second one. Two pattern
+    sets drift: a pattern added for the PR gate would silently not
+    protect the audit trail, and the failure would be invisible until a
+    secret was already persisted.
+
+    Different scope from `scan_for_secrets()` above, though, and the
+    difference matters: that function only inspects a diff's ADDED
+    lines, because a secret shown as context isn't a new leak. Here
+    every byte is in scope -- `agent_actions.arguments` is arbitrary
+    tool input (a file's whole contents via write_file, a diff via
+    patch_file), with no diff structure to reason about and no reason to
+    exempt any part of it.
+
+    Section 12.5: audit arguments are stored with secrets redacted.
+    Baseline-quality, not exhaustive -- the same honest limitation
+    `_BASELINE` carries for the PR gate. It reduces what lands in the
+    audit trail; it does not guarantee nothing sensitive ever does.
+    """
+    for _pattern_name, _reason, pattern in _BASELINE:
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def redact_arguments(arguments: dict | None) -> dict | None:
+    """Redact secrets from a tool call's arguments, preserving shape.
+
+    Recurses through nested dicts/lists so a secret nested inside a
+    structured argument is caught too. Non-string leaves pass through
+    untouched -- a secret has to be text to match a pattern, and coercing
+    ints/bools to strings would corrupt the stored arguments for no gain.
+    """
+    if arguments is None:
+        return None
+
+    def _walk(value):
+        if isinstance(value, str):
+            return redact_secrets(value)
+        if isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_walk(v) for v in value]
+        return value
+
+    return _walk(arguments)
