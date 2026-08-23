@@ -916,6 +916,87 @@ def concurrency() -> None:
 
 
 @app.group()
+def audit() -> None:
+    """Audit-log integrity (Section 12.6)."""
+
+
+@audit.command("verify")
+def audit_verify() -> None:
+    """Recompute the audit hash chain and report the first divergence."""
+    asyncio.run(_audit_verify())
+
+
+async def _audit_verify() -> None:
+    from amop.audit.chain import verify_chain
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+    async with session_factory() as session:
+        result = await verify_chain(session)
+
+    if result.unchained:
+        click.echo(
+            f"{result.unchained} row(s) predate hash-chaining and are "
+            "unverifiable -- run `amop audit backfill` to chain them "
+            "(attested as of backfill time, NOT as of when they were "
+            "written)."
+        )
+
+    if result.intact:
+        click.echo(f"Chain INTACT -- {result.checked} row(s) verified.")
+        if result.tip_hash:
+            click.echo()
+            click.echo(f"  tip: {result.tip_hash}")
+            click.echo()
+            # The one mitigation for the forward-recomputation attack
+            # verify_chain() structurally cannot catch (see
+            # audit/chain.py). Printed every run so recording it is easy;
+            # it only helps if the operator actually does.
+            click.echo(
+                "  Record this tip hash somewhere outside the database. "
+                "Verification alone cannot detect an attacker who alters "
+                "a row AND recomputes every hash after it -- but that "
+                "attack necessarily changes the tip, so a tip you saved "
+                "earlier will catch it."
+            )
+        return
+
+    click.echo("Chain BROKEN.", err=True)
+    click.echo(f"  first divergence at row id: {result.first_divergence_id}", err=True)
+    click.echo(f"  {result.reason}", err=True)
+    click.echo(f"  {result.checked} row(s) verified before the divergence.", err=True)
+    sys.exit(1)
+
+
+@audit.command("backfill")
+def audit_backfill() -> None:
+    """Hash-chain audit rows written before Milestone 22."""
+    asyncio.run(_audit_backfill())
+
+
+async def _audit_backfill() -> None:
+    from amop.audit.chain import backfill_chain
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+    async with session_factory() as session:
+        filled = await backfill_chain(session)
+
+    if not filled:
+        click.echo("Nothing to backfill -- every audit row is already chained.")
+        return
+    click.echo(f"Chained {filled} pre-existing row(s).")
+    click.echo(
+        "Note: these are attested as of NOW, not as of when they were "
+        "written. If any was already altered before this backfill, the "
+        "chain now certifies the altered version. No in-database "
+        "mechanism can do better retroactively."
+    )
+
+
+@app.group()
 def repos() -> None:
     """Manage the repository registry (Section 14.2)."""
 

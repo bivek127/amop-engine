@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from amop.audit.chain import append_chained
 from amop.database.models import Task, TaskTransition
 from amop.orchestrator.state_machine import (
     TERMINAL_STATES,
@@ -85,16 +86,6 @@ async def transition(
     if to_state in TERMINAL_STATES:
         task.resolved_at = now
 
-    session.add(
-        TaskTransition(
-            task_id=task.id,
-            from_state=from_state.value,
-            to_state=to_state.value,
-            trigger=trigger or spec_trigger,
-            actor=actor,
-            timestamp=now,
-        )
-    )
     # Captured BEFORE the rollback below. session.rollback() expires every
     # attribute on the instance, so reading task.id afterwards triggers a
     # lazy reload -- synchronous IO on an async session, which raises
@@ -105,7 +96,41 @@ async def transition(
     # Found by running the live demo instead. The assertion now pins the
     # exception TYPE, which is what would have caught it.
     task_id = task.id
+
+    # The OCC guard wraps BOTH the audit append and the commit, not the
+    # commit alone. Milestone 22 made that distinction load-bearing:
+    # append_chained() issues its own session.execute() calls (the
+    # advisory lock, the tip read), and SQLAlchemy AUTOFLUSHES pending
+    # changes before any query -- so the version-guarded UPDATE on
+    # `tasks` now fires inside append_chained(), and a lost OCC race
+    # raises StaleDataError there rather than at commit().
+    #
+    # With the try around commit() alone, that escaped as a raw
+    # StaleDataError and callers (api/routes/tasks.py's 409 mapping,
+    # transition_with_retry) silently stopped recognizing it as a
+    # conflict. Caught by Milestone 16's own exception-TYPE assertion --
+    # the one tightened in that milestone after a count-only version let
+    # a real bug through. Wrapping the whole region is also simply more
+    # honest: a flush can legitimately happen anywhere in here, and every
+    # such failure means the same thing.
     try:
+        # Milestone 22 (Section 12.6): stamped with its chain hashes and
+        # added to THIS transaction, so the audit row is atomic with the
+        # state change it records -- a rolled-back transition writes no
+        # audit row and leaves the chain untouched. The global advisory
+        # lock append_chained() takes releases at the commit below; see
+        # audit/chain.py for why read-tip -> insert must be exclusive.
+        await append_chained(
+            session,
+            TaskTransition(
+                task_id=task.id,
+                from_state=from_state.value,
+                to_state=to_state.value,
+                trigger=trigger or spec_trigger,
+                actor=actor,
+                timestamp=now,
+            ),
+        )
         await session.commit()
     except StaleDataError as exc:
         # Zero rows matched `WHERE id = ? AND version = ?` -- a competing

@@ -65,7 +65,23 @@ class Task(Base):
 
 class TaskTransition(Base):
     """Spec Section 14.2's `task_transitions` table — the append-only
-    decision audit trail (Section 4.2)."""
+    decision audit trail (Section 4.2).
+
+    Milestone 22 (Section 12.6 / ADR-16): hash-chained for tamper
+    EVIDENCE. Each row carries `sha256(prev_hash || canonical_content)`,
+    so a retroactive edit that bypasses the application (a DB superuser,
+    a future SQL-injection bug, direct disk access) becomes detectable by
+    recomputing the chain -- see audit/chain.py, which owns the
+    canonicalization and is the only place that should ever compute
+    these values.
+
+    Stated as bluntly as ADR-16 states it, because overclaiming here
+    would be worse than not building it: this is tamper evidence, NOT
+    tamper prevention, and these rows are NOT immutable. An attacker with
+    write access can alter a row AND recompute every subsequent hash
+    forward, producing a chain that verifies clean. True immutability
+    needs external WORM storage (spec's own post-MVP line, 29.6).
+    """
 
     __tablename__ = "task_transitions"
 
@@ -80,6 +96,13 @@ class TaskTransition(Base):
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # Milestone 22. Nullable because rows written before this milestone
+    # exist and stay readable -- `amop audit backfill` fills them, and
+    # verify_chain() reports unchained rows honestly rather than
+    # pretending a NULL hash is a passing one.
+    prev_hash: Mapped[str | None] = mapped_column(Text)
+    row_hash: Mapped[str | None] = mapped_column(Text)
 
 
 class CodeChunk(Base):
