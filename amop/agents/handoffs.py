@@ -184,6 +184,25 @@ class ReviewVerdict(BaseModel):
             "of doubt with no quoted code is not a valid rejection reason."
         ),
     )
+    counterexample_claim: dict | None = Field(
+        default=None,
+        description=(
+            "REQUIRED when you reject a diff whose tests already pass. A "
+            "STRUCTURED, EXECUTABLE version of your counterexample -- it "
+            "is actually run against the real code, so a claim that is "
+            "not true will be detected and your rejection overridden. "
+            'Format: {"module": "priority", "function": '
+            '"compute_priority_score", "calls": [{"name": "a", "args": '
+            '{"urgency": 2, "impact": 1, "effort": 10}, "expect": 13.0}, '
+            '{"name": "b", "args": {"urgency": 9, "impact": 8, "effort": '
+            '1}, "expect": 43.5}], "claim": "a > b"}. `module` and '
+            "`function` are bare identifiers from the diff. `args` are "
+            "the literal arguments. `expect` is what you claim that call "
+            "returns. `claim` is a single comparison between call names "
+            "(a > b, a == b, ...). Both your `expect` values and your "
+            "`claim` are checked against what the code really does."
+        ),
+    )
     counterexample: str | None = Field(
         default=None,
         description=(

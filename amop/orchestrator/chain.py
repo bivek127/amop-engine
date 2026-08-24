@@ -51,6 +51,11 @@ from amop.codebase_intel.indexer import index_repo
 from amop.database.models import PullRequest, Task
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
+from amop.orchestrator.counterexample import (
+    CounterexampleResult,
+    CounterexampleStatus,
+    verify_counterexample,
+)
 from amop.orchestrator.concurrency import (
     engine_for,
     gated_by_task_slot,
@@ -218,6 +223,7 @@ def _override_ungrounded_rejection(
     changed_files: list[str],
     report: RootCauseReport,
     tests_passed: bool,
+    counterexample_status: CounterexampleStatus = CounterexampleStatus.NONE,
 ) -> ReviewVerdict:
     """The one mechanical check in this module that can turn a rejection
     into an approval, not just the reverse -- added after live runs
@@ -251,8 +257,26 @@ def _override_ungrounded_rejection(
         return verdict
     if out_of_scope_files(changed_files, report.affected_files):
         return verdict
-    if _has_concrete_counterexample(verdict):
+    # Milestone 24: the bar is now EXECUTED truth, not shape. A claim
+    # that ran and held up is the only thing that keeps a rejection
+    # standing; one that ran and was contradicted by the real code no
+    # longer does, which is exactly the Milestone 14 fabrication this
+    # attempt exists to close.
+    if counterexample_status is CounterexampleStatus.VERIFIED:
         return verdict
+
+    if counterexample_status is CounterexampleStatus.REFUTED:
+        why = (
+            "its counterexample was EXECUTED against the real code and "
+            "contradicted by it"
+        )
+    elif counterexample_status is CounterexampleStatus.UNAVAILABLE:
+        why = (
+            "its counterexample could not be executed (malformed, "
+            "un-runnable, or timed out), so nothing grounds it"
+        )
+    else:
+        why = "the rejection named no concrete input/output counterexample"
 
     return verdict.model_copy(
         update={
@@ -260,8 +284,7 @@ def _override_ungrounded_rejection(
             "rejection_reason": (
                 "MECHANICALLY OVERRIDDEN (chain._override_ungrounded_rejection): "
                 "all tests pass and the diff is confined to the root cause's "
-                "affected_files, but the rejection named no concrete "
-                f"input/output counterexample. Original verdict: approved=False"
+                f"affected_files, but {why}. Original verdict: approved=False"
                 + (f" -- {verdict.rejection_reason}" if verdict.rejection_reason else "")
             ),
         }
@@ -273,6 +296,7 @@ def enforce_review_checks(
     changed_files: list[str],
     report: RootCauseReport,
     tests_passed: bool = True,
+    counterexample_status: CounterexampleStatus = CounterexampleStatus.NONE,
 ) -> ReviewVerdict:
     """Apply the mechanical checks that sit on top of the Reviewer's
     judgment. An approval is a model opinion; these are not.
@@ -287,9 +311,20 @@ def enforce_review_checks(
     (this function predates the override and was widely called with just
     3 positional args) behaving exactly as before; run_chain always
     passes the real ground-truth value explicitly.
+
+    `counterexample_status` (Milestone 24) is the ALREADY-EXECUTED
+    outcome of the Reviewer's counterexample, passed in as plain data
+    rather than computed here. That is deliberate and follows Milestone
+    20's own precedent for D-8 permission overrides: executing a claim
+    in a sandbox is I/O, and this function's purity -- no LLM call, no
+    database, no Docker, unit-testable in isolation (see this module's
+    docstring) -- is a property worth more than the convenience of
+    inlining the call. run_chain resolves it once, just above.
     """
     if not verdict.approved:
-        return _override_ungrounded_rejection(verdict, changed_files, report, tests_passed)
+        return _override_ungrounded_rejection(
+            verdict, changed_files, report, tests_passed, counterexample_status
+        )
 
     strayed = out_of_scope_files(changed_files, report.affected_files)
     if strayed:
@@ -709,8 +744,23 @@ async def run_chain(
             # here in practice -- passed explicitly rather than relying
             # on the default, since that default exists for other/older
             # call sites, not this one.
+            # Milestone 24: execute the Reviewer's counterexample against
+            # the real code BEFORE the gate runs, so the gate itself
+            # stays pure (see enforce_review_checks' docstring). Only on
+            # a rejection -- an approval has no counterexample to test.
+            ce_result = CounterexampleResult(CounterexampleStatus.NONE, "approved")
+            if not verdict.approved:
+                ce_result = await verify_counterexample(
+                    verdict.counterexample_claim, ctx.sandbox
+                )
+                stage(f"REVIEWING: counterexample {ce_result.status.value} — {ce_result.detail}")
+
             checked = enforce_review_checks(
-                verdict, code_report.files_changed, report, tests_passed=test_report.all_passed
+                verdict,
+                code_report.files_changed,
+                report,
+                tests_passed=test_report.all_passed,
+                counterexample_status=ce_result.status,
             )
             if checked.approved != verdict.approved:
                 direction = "approved -> rejected" if verdict.approved else "rejected -> approved"

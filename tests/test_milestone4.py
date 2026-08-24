@@ -218,6 +218,7 @@ def review_answer(
     reason: str | None = None,
     addresses_symptom: bool = True,
     counterexample: str | None = None,
+    counterexample_claim: dict | None = None,
 ) -> str:
     return final(
         {
@@ -236,6 +237,7 @@ def review_answer(
             ],
             "rejection_reason": reason,
             "counterexample": counterexample,
+            "counterexample_claim": counterexample_claim,
         }
     )
 
@@ -526,15 +528,31 @@ async def test_reviewer_rejection_routes_back_to_coding_with_findings(session, w
         reviewer=ReviewerAgent(
             ScriptedLLM(
                 [
-                    # A real counterexample, so the mechanical override
-                    # (chain._override_ungrounded_rejection) doesn't
-                    # convert this rejection straight to an approval --
-                    # this test is specifically about a *grounded*
-                    # rejection getting addressed on retry.
+                    # A grounded rejection -- this test is about a
+                    # rejection SURVIVING the mechanical override and
+                    # getting addressed on retry, so the counterexample
+                    # has to be one that actually holds up.
+                    #
+                    # Milestone 24: prose alone no longer does that. The
+                    # structured claim below is executed against the real
+                    # `average` in the sandbox, where calling it with []
+                    # genuinely raises ZeroDivisionError -- so it
+                    # verifies, and the rejection stands.
                     review_answer(
                         False,
                         "the fix needs a guard for empty input",
                         counterexample="average([]) with 0 items -> raises ZeroDivisionError, should raise ValueError instead",
+                        counterexample_claim={
+                            "module": "calculator",
+                            "function": "Calculator.average",
+                            "calls": [
+                                {
+                                    "name": "empty",
+                                    "args": {"values": []},
+                                    "expect_raises": "ValueError",
+                                }
+                            ],
+                        },
                     ),
                     review_answer(True),
                 ]
@@ -907,7 +925,20 @@ def test_ungrounded_rejection_is_overridden_when_tests_pass_and_diff_in_scope():
     assert "MECHANICALLY OVERRIDDEN" in checked.rejection_reason
 
 
-def test_rejection_with_a_real_counterexample_is_not_overridden():
+def test_rejection_with_a_prose_only_counterexample_IS_now_overridden():
+    """CONTRACT CHANGED IN MILESTONE 24 -- this test previously asserted
+    the opposite, and the change is the point of that milestone.
+
+    Prose used to keep a rejection alive if it merely had digits and
+    enough length. Milestone 14 proved that gameable: a model supplied a
+    well-shaped, arithmetically FALSE claim and its rejection of a
+    correct diff stood. (This test's own former counterexample was an
+    example -- it claims (9,8,1) scores 31.0 and (2,1,10) scores 8.0;
+    under the fixture's formula those are 43.0 and 0.8.)
+
+    Only an EXECUTED, verified claim keeps a rejection now. Prose is
+    still carried for humans to read, but it no longer decides anything.
+    """
     checked = enforce_review_checks(
         _verdict(
             approved=False,
@@ -921,7 +952,8 @@ def test_rejection_with_a_real_counterexample_is_not_overridden():
         _report(1.0),
         tests_passed=True,
     )
-    assert checked.approved is False
+    assert checked.approved is True
+    assert "no concrete input/output counterexample" in checked.rejection_reason
 
 
 def test_rejection_is_not_overridden_when_tests_are_failing():
