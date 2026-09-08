@@ -1,0 +1,52 @@
+# Node sandbox image — spec Section 9.2, Milestone 25's one addition to
+# the per-stack-image architecture (the Python image's own Dockerfile
+# explicitly named this as later work). Same isolation posture as the
+# Python image (SandboxManager applies non-root/network-off/cap-drop/
+# resource-limit settings identically regardless of image, Section 9.3)
+# -- only the base image and its pre-installed tool-belt differ.
+FROM node:20-slim
+
+# procps + git: same reasoning as the Python image's Dockerfile --
+# exec_run()'s timeout path needs the real `kill` binary (not just sh's
+# builtin), and the chain branches/commits/diffs inside the container.
+RUN apt-get update && apt-get install -y --no-install-recommends procps git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Jest (Milestone 25): baked into the image rather than installed per
+# task, for the same reason pytest is baked into the Python image --
+# containers run with network_mode="none" (Section 9.3), so there is no
+# npm-install path from inside a live sandbox. Installed globally so a
+# fixture's own package.json doesn't need to declare it as a
+# dependency, matching the Python fixtures' pattern (none of them list
+# pytest either).
+RUN npm install -g jest
+
+# Non-root user inside the container (Section 9.3's isolation table).
+# Same fixed uid as the Python image (sandbox/manager.py's
+# CONTAINER_UID) -- host-side code chowns file writes to it without
+# querying either image at runtime. node:20-slim already ships its own
+# uid-1000 user (named "node", for the same reason -- upstream's own
+# non-root default) -- removed first so useradd doesn't collide on the
+# uid, and so both sandbox images have an identically-named "amop" user
+# rather than one image saying "amop" and the other "node".
+RUN userdel -r node \
+    && useradd --uid 1000 --create-home --shell /bin/sh amop
+
+WORKDIR /workspace
+RUN chown amop:amop /workspace
+
+USER amop
+
+# Git identity + defaults for the sandbox user (same reasoning as the
+# Python image: no configured identity means every commit fails
+# outright, and there's no interactive way to supply one inside a
+# network-less container).
+RUN git config --global user.email "agent@amop.local" \
+    && git config --global user.name "AMOP Agent" \
+    && git config --global init.defaultBranch main \
+    && git config --global --add safe.directory /workspace
+
+# Kept alive with a no-op process so the Sandbox Manager can `exec` into
+# the same container repeatedly across a task's tool calls (Section
+# 9.1: one container per task, not per call).
+CMD ["tail", "-f", "/dev/null"]

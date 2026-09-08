@@ -562,6 +562,13 @@ def _parse_junit_xml(xml_text: str) -> dict:
     Parsing the machine-readable report rather than scraping stdout is
     what makes this runner-agnostic per 8.6, and it's why `all_passed`
     can be a fact rather than a model's opinion.
+
+    Milestone 25 note on that claim: it was only ever true of this
+    function. The invocation side (the run_tests body below) was a
+    single hardcoded pytest command with no detection logic at all --
+    this docstring's own "runner-agnostic per 8.6" was aspirational
+    until _parse_jest_json (below) gave a second report format feeding
+    the exact same normalized shape.
     """
     root = ET.fromstring(xml_text)
     suite = root.find("testsuite") if root.tag == "testsuites" else root
@@ -591,12 +598,52 @@ def _parse_junit_xml(xml_text: str) -> dict:
     }
 
 
+def _parse_jest_json(json_text: str) -> dict:
+    """Normalize Jest's `--json` output into the exact same Section 8.6
+    shape _parse_junit_xml produces. This is the actual runner-
+    agnosticism fix: two structurally different report formats (JUnit
+    XML for pytest, Jest's own JSON for Jest) feeding one shape, so
+    nothing downstream (the orchestrator's ground-truth check, the
+    flaky-test re-run logic) needs to know which runner produced it.
+
+    `--testLocationInResults` (passed alongside `--json` in run_tests
+    below) is what makes `location.line` populated -- without it Jest
+    leaves `location: null` on every assertion and the normalized
+    `line` field would always be None, a real loss relative to
+    pytest's junit-xml (which always carries a line number).
+    """
+    data = json.loads(json_text)
+    failures = []
+    for suite in data.get("testResults", []):
+        file_path = suite.get("name")
+        for assertion in suite.get("assertionResults", []):
+            if assertion.get("status") != "failed":
+                continue
+            location = assertion.get("location") or {}
+            messages = assertion.get("failureMessages") or []
+            failures.append(
+                {
+                    "test_name": assertion.get("fullName") or assertion.get("title", ""),
+                    "message": (messages[0] if messages else "")[:500],
+                    "file": file_path,
+                    "line": location.get("line"),
+                }
+            )
+    return {
+        "passed": data.get("numPassedTests", 0),
+        "failed": data.get("numFailedTests", 0),
+        "skipped": data.get("numPendingTests", 0),
+        "failures": failures,
+    }
+
+
 @tool(
     name="run_tests",
     description=(
-        "Run the repository's pytest suite inside the sandbox and return "
-        "structured results. Optionally pass 'path' to run only the tests "
-        "at that path. Does not modify any source file."
+        "Run the repository's test suite inside the sandbox (pytest for "
+        "Python repos, Jest for JavaScript) and return structured "
+        "results. Optionally pass 'path' to run only the tests at that "
+        "path. Does not modify any source file."
     ),
     parameters={
         "type": "object",
@@ -636,11 +683,24 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
             )
         target = _container_path(resolved, ctx.scratch_dir)
 
-    report_path = f"/tmp/amop-junit-{uuid.uuid4().hex}.xml"
-    command = (
-        f"cd /workspace && python -m pytest {target} "
-        f"--junit-xml={report_path} -q"
-    )
+    # Milestone 25: the actual runner-dispatch fix. ctx.stack is
+    # resolved once in chain.py (detect_stack, right after materialize,
+    # before the sandbox is even created -- see indexer.py) and passed
+    # in as plain data, same D-8 pattern as permission_overrides. Python
+    # path below is byte-for-byte the pre-Milestone-25 command.
+    if ctx.stack == "javascript":
+        report_path = f"/tmp/amop-jest-{uuid.uuid4().hex}.json"
+        jest_target = "" if target == "." else f" {target}"
+        command = (
+            f"cd /workspace && jest --json --testLocationInResults "
+            f"--outputFile={report_path}{jest_target}"
+        )
+    else:
+        report_path = f"/tmp/amop-junit-{uuid.uuid4().hex}.xml"
+        command = (
+            f"cd /workspace && python -m pytest {target} "
+            f"--junit-xml={report_path} -q"
+        )
     try:
         result = await asyncio.to_thread(
             ctx.sandbox.exec_run, command, TEST_TIMEOUT_SECONDS
@@ -656,16 +716,22 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
         )
 
     try:
-        xml_text = await asyncio.to_thread(ctx.sandbox.read_file, report_path)
-        summary = _parse_junit_xml(xml_text)
-    except (FileNotFoundError, ET.ParseError):
-        # pytest couldn't even produce a report (collection error, no
-        # tests found, ...). Surface the raw output as evidence instead
-        # of pretending we got a clean zero-failure result.
+        report_text = await asyncio.to_thread(ctx.sandbox.read_file, report_path)
+        if ctx.stack == "javascript":
+            summary = _parse_jest_json(report_text)
+        else:
+            summary = _parse_junit_xml(report_text)
+    except (FileNotFoundError, ET.ParseError, json.JSONDecodeError):
+        # The runner couldn't even produce a report (collection error,
+        # no tests found, no config file, ...). Surface the raw output
+        # as evidence instead of pretending we got a clean zero-failure
+        # result.
+        runner_name = "jest" if ctx.stack == "javascript" else "pytest"
         return ToolResult(
             success=False,
             error_code="NO_TEST_REPORT",
-            message=(result.stdout + result.stderr)[-2000:] or "pytest produced no report",
+            message=(result.stdout + result.stderr)[-2000:]
+            or f"{runner_name} produced no report",
         )
 
     summary["all_passed"] = summary["failed"] == 0 and summary["passed"] > 0

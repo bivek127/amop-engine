@@ -1,6 +1,10 @@
 """Repository Indexing — spec Section 7.1, trimmed to Milestone 5's
 declared scope: `.py` files only, freshly re-indexed every run rather
-than incrementally (both explicit CLAUDE.md simplifications).
+than incrementally (both explicit CLAUDE.md simplifications). Milestone
+25 widens the walk to `.py` + `.js` and adds `detect_stack`, spec
+6.3.4's "primary language(s) by file-extension histogram" -- previously
+`repositories.detected_stack` existed only as an unpopulated DB column
+(Milestone 20 added the column, nothing ever wrote it).
 
 Reads files directly from the host-side scratch directory rather than
 issuing one sandbox.exec_run/read_file per matched file. This is
@@ -30,6 +34,14 @@ from amop.database.models import CodeChunk
 
 _ALWAYS_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv"}
 
+# Milestone 25: extension -> language name, used by both detect_stack
+# (image/routing decision) and the source walk below (which extensions
+# get indexed at all). Deliberately just the two spec 6.3.4 calls for --
+# framework/manifest sniffing (package.json dependency inspection) is
+# explicitly out of scope per CLAUDE.md's Milestone 25 scope decisions;
+# this milestone only needs "is this repo Python or JavaScript."
+_LANGUAGE_EXTENSIONS = {".py": "python", ".js": "javascript"}
+
 # Milestone 8: chunker.py's own CHUNK_MAX_TOKENS=800 budget is only
 # enforced on classes (splitting an over-budget class into one chunk per
 # method) -- standalone functions, individual methods, and the "module"
@@ -54,20 +66,57 @@ def _load_gitignore(source_dir: Path) -> pathspec.PathSpec | None:
     return pathspec.PathSpec.from_lines("gitignore", lines)
 
 
-def _walk_python_files(source_dir: Path) -> list[Path]:
-    """.py files under source_dir, respecting .gitignore (Section 7.1) via
-    pathspec's real gitwildmatch semantics -- not a hand-rolled fnmatch
-    that would get negation/anchoring/directory patterns subtly wrong."""
+def _walk_source_files(source_dir: Path) -> list[Path]:
+    """Every `.py`/`.js` file under source_dir, respecting .gitignore
+    (Section 7.1) via pathspec's real gitwildmatch semantics -- not a
+    hand-rolled fnmatch that would get negation/anchoring/directory
+    patterns subtly wrong. Milestone 5 walked `.py` only; Milestone 25
+    widens to every extension chunk_source knows how to dispatch."""
     spec = _load_gitignore(source_dir)
     matches = []
-    for path in sorted(source_dir.rglob("*.py")):
-        relative = path.relative_to(source_dir)
-        if any(part in _ALWAYS_SKIP_DIRS for part in relative.parts):
-            continue
-        if spec is not None and spec.match_file(str(relative)):
-            continue
-        matches.append(path)
-    return matches
+    for pattern in (f"*{ext}" for ext in _LANGUAGE_EXTENSIONS):
+        for path in source_dir.rglob(pattern):
+            relative = path.relative_to(source_dir)
+            if any(part in _ALWAYS_SKIP_DIRS for part in relative.parts):
+                continue
+            if spec is not None and spec.match_file(str(relative)):
+                continue
+            matches.append(path)
+    return sorted(matches)
+
+
+def detect_stack(source_dir: Path) -> dict:
+    """Spec 6.3.4: "primary language(s) by file-extension histogram."
+    Deliberately just an extension count, not manifest/framework
+    sniffing (package.json dependency inspection is explicitly out of
+    scope -- CLAUDE.md's Milestone 25 scope decisions) -- this only
+    needs to answer "is this repo Python or JavaScript" well enough to
+    pick a chunker and a sandbox image, nothing more.
+
+    Called from two places for one reason: sandbox image selection
+    (chain.py) has to happen before index_repo can run at all -- the
+    container has to exist before indexing can populate it -- so
+    detection can't be a byproduct of indexing here. Cheap enough
+    (a single directory walk) that running it twice costs nothing
+    concurrency- or correctness-relevant.
+
+    Returns {"languages": {name: file_count, ...}, "primary": name |
+    None}. `primary` is None only for an empty/unrecognized repo.
+    """
+    source_dir = Path(source_dir)
+    spec = _load_gitignore(source_dir)
+    languages: dict[str, int] = {}
+    for ext, language in _LANGUAGE_EXTENSIONS.items():
+        for path in source_dir.rglob(f"*{ext}"):
+            relative = path.relative_to(source_dir)
+            if any(part in _ALWAYS_SKIP_DIRS for part in relative.parts):
+                continue
+            if spec is not None and spec.match_file(str(relative)):
+                continue
+            languages[language] = languages.get(language, 0) + 1
+
+    primary = max(languages, key=languages.get) if languages else None
+    return {"languages": languages, "primary": primary}
 
 
 _TRUNCATION_MARKER = "\n# [AMOP: content truncated for embedding -- see indexer.py]"
@@ -120,10 +169,10 @@ def _prepare_for_embedding(chunk: Chunk) -> str:
 async def index_repo(
     session: AsyncSession, repo_path: str, source_dir: Path
 ) -> int:
-    """Chunk + embed + store every .py file under source_dir, tagged with
-    `repo_path` as the stable index identity (the resolved SOURCE repo
-    path -- see database/models.py's CodeChunk docstring for why that,
-    not the ephemeral scratch dir, is the right key).
+    """Chunk + embed + store every .py/.js file under source_dir, tagged
+    with `repo_path` as the stable index identity (the resolved SOURCE
+    repo path -- see database/models.py's CodeChunk docstring for why
+    that, not the ephemeral scratch dir, is the right key).
 
     "Index fresh each time" (CLAUDE.md's authorized simplification over
     Section 7.1's incremental re-index): every call deletes all existing
@@ -138,7 +187,7 @@ async def index_repo(
     await session.execute(delete(CodeChunk).where(CodeChunk.repo_path == repo_path))
 
     all_chunks = []
-    for file in _walk_python_files(source_dir):
+    for file in _walk_source_files(source_dir):
         relative_path = str(file.relative_to(source_dir))
         try:
             source = file.read_text()

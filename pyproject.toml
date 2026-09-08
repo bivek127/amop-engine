@@ -21,6 +21,8 @@ dependencies = [
     "itsdangerous",
     "python-multipart",
     "python-telegram-bot[job-queue]",
+    "tree-sitter",
+    "tree-sitter-javascript",
 ]
 
 [project.optional-dependencies]

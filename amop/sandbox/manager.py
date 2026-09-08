@@ -24,6 +24,16 @@ egress allowlist proxy, per-stack images beyond Python (9.2), dependency
 caching (9.5), and Section 9.7.1's periodic orphan-container sweep timer
 — containers are still labeled `amop.task_id` so that sweep can be added
 later without a data-model change, but no background timer runs yet.
+
+Milestone 25 adds the second per-stack image (9.2's `amop/sandbox-node`)
+that this milestone's docstring named as later work. `create()` gains a
+`stack` parameter (default "python", so every existing caller/test is
+unaffected); image build moves from eager (once, in __init__) to lazy
+per-stack (on first create() for that stack) since a Node-only or
+Python-only process shouldn't pay to build an image it never uses.
+Isolation settings (non-root, network_mode="none", cap_drop, resource
+limits) are identical across images -- only the base image and its
+pre-installed tool-belt differ.
 """
 
 import io
@@ -40,7 +50,19 @@ import docker.errors
 from docker.models.containers import Container
 
 IMAGE_NAME = os.environ.get("AMOP_SANDBOX_IMAGE", "amop-sandbox:latest")
+NODE_IMAGE_NAME = os.environ.get("AMOP_SANDBOX_NODE_IMAGE", "amop-sandbox-node:latest")
 DOCKERFILE_DIR = Path(__file__).parent
+
+# stack name (matches codebase_intel.indexer.detect_stack's "primary"
+# value) -> (image tag, Dockerfile filename within DOCKERFILE_DIR).
+# "python" is also the fallback for an unrecognized/undetected stack --
+# every task before Milestone 25 was implicitly Python-only, so an
+# empty/mixed/unknown repo defaults to the image that behavior always
+# used, not a hard error.
+STACK_IMAGES = {
+    "python": (IMAGE_NAME, "Dockerfile"),
+    "javascript": (NODE_IMAGE_NAME, "Dockerfile.node"),
+}
 
 CPU_LIMIT = float(os.environ.get("AMOP_SANDBOX_CPU_LIMIT", "1"))
 MEMORY_LIMIT_MB = int(os.environ.get("AMOP_SANDBOX_MEMORY_LIMIT_MB", "1024"))
@@ -248,15 +270,28 @@ class SandboxManager:
     def __init__(self) -> None:
         self._client = docker.from_env()
         self._sandboxes: dict[str, Sandbox] = {}
-        self._ensure_image()
+        # Milestone 25: image build is now lazy per-stack (see create()),
+        # not eager here -- a process that only ever handles Python tasks
+        # shouldn't pay to build an image it never uses, and vice versa.
 
-    def _ensure_image(self) -> None:
+    def _ensure_image(self, stack: str) -> str:
+        """Builds the stack's image if missing, returns its tag. Unknown
+        stack falls back to "python" (see STACK_IMAGES' own docstring)."""
+        tag, dockerfile = STACK_IMAGES.get(stack, STACK_IMAGES["python"])
         try:
-            self._client.images.get(IMAGE_NAME)
+            self._client.images.get(tag)
         except docker.errors.ImageNotFound:
-            self._client.images.build(path=str(DOCKERFILE_DIR), tag=IMAGE_NAME, rm=True)
+            self._client.images.build(
+                path=str(DOCKERFILE_DIR), dockerfile=dockerfile, tag=tag, rm=True
+            )
+        return tag
 
-    def create(self, task_id: str, host_scratch_dir: Path) -> Sandbox:
+    def create(self, task_id: str, host_scratch_dir: Path, stack: str = "python") -> Sandbox:
+        """`stack` selects the image (Section 9.2's per-stack images) --
+        "python" (default, preserves every pre-Milestone-25 caller's
+        behavior unchanged) or "javascript". Isolation settings below are
+        identical across images; only the image tag differs."""
+        image_tag = self._ensure_image(stack)
         host_scratch_dir = Path(host_scratch_dir)
         host_scratch_dir.mkdir(parents=True, exist_ok=True)
         # Bind mounts on Docker Desktop don't reliably line up with the
@@ -267,7 +302,7 @@ class SandboxManager:
         os.chmod(host_scratch_dir, 0o777)
 
         container = self._client.containers.run(
-            IMAGE_NAME,
+            image_tag,
             command=["tail", "-f", "/dev/null"],
             detach=True,
             user=str(CONTAINER_UID),

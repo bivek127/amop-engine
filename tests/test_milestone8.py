@@ -33,7 +33,7 @@ from amop.codebase_intel.indexer import (
     MAX_CHUNK_CHARS_FOR_EMBEDDING,
     _TRUNCATION_MARKER,
     _prepare_for_embedding,
-    _walk_python_files,
+    _walk_source_files,
     index_repo,
 )
 from amop.database.models import CodeChunk
@@ -199,7 +199,7 @@ def _load_real_invoke_chunks() -> list[Chunk]:
         "to a local checkout of bivek127/amop-invoke-scratch"
     )
     all_chunks: list[Chunk] = []
-    for file in _walk_python_files(AMOP_INVOKE_REPO):
+    for file in _walk_source_files(AMOP_INVOKE_REPO):
         relative = str(file.relative_to(AMOP_INVOKE_REPO))
         try:
             source = file.read_text()

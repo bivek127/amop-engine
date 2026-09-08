@@ -47,7 +47,7 @@ from amop.agents.handoffs import (
 from amop.agents.investigator import InvestigatorAgent
 from amop.agents.reviewer import ReviewerAgent
 from amop.agents.tester import TesterAgent
-from amop.codebase_intel.indexer import index_repo
+from amop.codebase_intel.indexer import detect_stack, index_repo
 from amop.database.models import PullRequest, Task
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
@@ -65,7 +65,7 @@ from amop.orchestrator.concurrency import (
 from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
-from amop.safety.permissions import load_permission_overrides
+from amop.safety.permissions import load_permission_overrides, normalize_repo_identity
 from amop.safety.untrusted_input import wrap_untrusted
 from amop.sandbox import repo as git_repo
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
@@ -1305,6 +1305,34 @@ async def _record_incident_memory(
         emit(f"memory: recorded incident memory {item.id}")
 
 
+async def _persist_detected_stack(
+    session: AsyncSession, resolved_repo_path: str, stack_info: dict
+) -> None:
+    """Writes repositories.detected_stack (Milestone 20's column,
+    unpopulated by anything until now -- see Milestone 25's own
+    planning notes). Mirrors load_permission_overrides' exact lookup
+    pattern (same normalize_repo_identity, same "unregistered repo is
+    not an error" handling) -- reusing it rather than re-deriving repo
+    identity here, for the same reason permissions.py gives: two
+    definitions of "the same repo" could drift apart.
+
+    No explicit commit here -- the row (if any) is already attached to
+    `session`; the attribute mutation rides along with whatever this
+    session's next real commit is (index_repo(), moments later in
+    run_fix, always commits).
+    """
+    from sqlalchemy import select
+
+    from amop.database.models import Repository
+
+    normalized = normalize_repo_identity(resolved_repo_path)
+    row = (
+        await session.execute(select(Repository).where(Repository.repo_path == normalized))
+    ).scalar_one_or_none()
+    if row is not None:
+        row.detected_stack = stack_info
+
+
 # ---------------------------------------------------------------------
 # Full lifecycle entry point
 # ---------------------------------------------------------------------
@@ -1335,9 +1363,19 @@ async def run_fix(
     resolved_repo_path = str(Path(repo_path).resolve())
     await asyncio.to_thread(git_repo.materialize, Path(repo_path), scratch_dir)
 
+    # Milestone 25 / spec 6.3.4: language detection has to happen here,
+    # on the host-side scratch_dir, BEFORE the sandbox exists -- image
+    # selection (Section 9.2) is a precondition of manager.create()
+    # below, and index_repo() (which also needs this) doesn't run until
+    # after the container is up. One walk, its result reused by both.
+    stack_info = await asyncio.to_thread(detect_stack, scratch_dir)
+    stack = stack_info["primary"] or "python"
+    emit(f"Detected stack: {stack_info['languages']} -> {stack}")
+    await _persist_detected_stack(session, resolved_repo_path, stack_info)
+
     manager = await asyncio.to_thread(SandboxManager)
     task_id = str(task.id)
-    sandbox = await asyncio.to_thread(manager.create, task_id, scratch_dir)
+    sandbox = await asyncio.to_thread(manager.create, task_id, scratch_dir, stack)
     try:
         await asyncio.to_thread(git_repo.init_baseline, sandbox)
         await asyncio.to_thread(
@@ -1365,6 +1403,7 @@ async def run_fix(
             db_session=session,
             permission_overrides=overrides,
             task_id=task.id,
+            stack=stack,
         )
         agents = ChainAgents.build(model, ctx, task_id)
         emit(f"Sandbox container: {sandbox.short_id}")

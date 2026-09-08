@@ -73,6 +73,16 @@ class ToolContext:
     # pre-Milestone-20 call site's existing behavior.
     permission_overrides: dict | None = None
 
+    # Milestone 25 / spec 6.3.4: which language/runner this task's repo
+    # was detected as (codebase_intel.indexer.detect_stack's "primary"),
+    # resolved ONCE in chain.py right after materialize() -- same D-8
+    # pattern as permission_overrides above: an I/O-dependent value
+    # resolved by the context's builder, passed in as plain data, so
+    # tools (and any pure logic that reads it) stay unit-testable
+    # without needing a real repo on disk. Defaults to "python" so every
+    # pre-Milestone-25 ToolContext(...) call site is unaffected.
+    stack: str = "python"
+
 
 @dataclass
 class ToolResult:
