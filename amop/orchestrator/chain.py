@@ -1100,35 +1100,60 @@ async def _run_tester(
         # for why (a fresh regression test failing pre-fix, or the exact
         # bug report's own named test failing on both branches, is the
         # expected/correct signal, not noise).
-        candidates: dict[str, str] = {}
+        # Milestone 26: (file, test_name) as separate fields, NOT a
+        # joined `file::test_name` nodeid. That nodeid form is pytest's
+        # native selector and meaningless to Jest -- passing it as a
+        # path made Jest run the whole suite, which the carve-out below
+        # then read as "this test fails on base too" and used to force
+        # all_passed=True on a genuinely red suite. run_tests now does
+        # the runner-specific name filtering itself.
+        candidates: dict[str, tuple[str | None, str]] = {}
         for f in ground_truth["failures"]:
             name = f["test_name"]
             if tester_mod.is_carveout_protected(name, description, handoff_new_tests):
                 continue
-            nodeid = f"{f['file']}::{name}" if f.get("file") else name
-            candidates[name] = nodeid
+            candidates[name] = (f.get("file"), name)
 
-        base_by_nodeid = await _rerun_failing_tests_against_base(
+        base_by_name = await _rerun_failing_tests_against_base(
             ctx, list(candidates.values())
         )
-        base_by_name = {
-            name: base_by_nodeid.get(nodeid, False) for name, nodeid in candidates.items()
-        }
 
         excluded, effective = tester_mod.classify_failures(
             fix_branch_failing, base_by_name, description, handoff_new_tests
         )
         if excluded:
             details = (
-                f"{details} | excluded as environmental noise "
-                f"(fails on base branch too): {excluded}"
+                f"{details} | also fails on the base branch "
+                f"(may be pre-existing, not caused by this fix): {excluded}"
             )
         if effective:
             details = f"{details} | failing: {', '.join(effective)}"
-        # Ground truth said failed, but every failure that's still real
-        # signal after the carve-out-aware double-check is empty -- the
-        # suite is effectively green for this milestone's purposes.
-        all_passed = all_passed or not effective
+        # Milestone 26: this classification ANNOTATES `details`; it must
+        # never flip `all_passed`. There used to be an
+        # `all_passed = all_passed or not effective` here, and it was a
+        # false-green generator: in a bug_fix task the base branch IS the
+        # unfixed buggy code, so the bug's own failing test always fails
+        # on base and always looked like "environmental noise." Section
+        # 29.1's escape hatch (is_carveout_protected) only fires when the
+        # description literally contains the test's name -- true for a CI
+        # failure report, false for every natural-language bug report
+        # AMOP actually receives -- so nothing protected it.
+        #
+        # It stayed dormant for 22 milestones only because the per-test
+        # re-run was broken on every runner (see
+        # _rerun_failing_tests_against_base) and the fail-safe default
+        # kept every failure. Fixing that selector activated it, and a
+        # live run reported all_passed=True over a genuinely red suite,
+        # feeding the Reviewer "Test suite currently passing: True" while
+        # the bug was still present.
+        #
+        # The tradeoff, taken deliberately: a repo with a genuinely
+        # broken unrelated test can no longer reach RESOLVED. That fails
+        # closed and visibly, which is the direction this project errs in
+        # everywhere else -- a heuristic must not manufacture a green
+        # verdict the test runner never gave (Milestone 4's
+        # "the chain must believe pytest, not the model", which is the
+        # invariant whose test caught this).
 
     return TestReport(
         task_id=task_id,
@@ -1139,19 +1164,29 @@ async def _run_tester(
     )
 
 
-async def _rerun_failing_tests_against_base(ctx, nodeids: list[str]) -> dict[str, bool]:
-    """Re-run each of `nodeids` against sandbox.repo.BASE_BRANCH (the
-    pre-fix commit) and report whether it failed there too. Restores the
-    original branch (and any stashed changes) in a `finally`, regardless
-    of outcome -- this must never leave the sandbox checked out somewhere
-    other than where the rest of the chain expects it.
+async def _rerun_failing_tests_against_base(
+    ctx, targets: list[tuple[str | None, str]]
+) -> dict[str, bool]:
+    """Re-run each (file, test_name) against sandbox.repo.BASE_BRANCH
+    (the pre-fix commit) and report, keyed by test name, whether it
+    failed there too. Restores the original branch (and any stashed
+    changes) in a `finally`, regardless of outcome -- this must never
+    leave the sandbox checked out somewhere other than where the rest of
+    the chain expects it.
 
-    An inconclusive re-run (tool error, timeout) simply leaves that
-    nodeid out of the returned dict; classify_failures' fail-safe default
+    Milestone 26: `file` and `test_name` are passed as separate
+    arguments so run_tests can apply its runner's own name filter (-k
+    for pytest, -t for Jest). They used to be joined into a pytest
+    `file::test_name` nodeid and passed as a path, which Jest could not
+    interpret -- see run_tests' own comment for how that turned a red
+    suite into all_passed=True.
+
+    An inconclusive re-run (tool error, timeout) simply leaves that name
+    out of the returned dict; classify_failures' fail-safe default
     treats an absent entry as "not conclusively flaky", so a test never
     gets silently excluded on an inconclusive result.
     """
-    if not nodeids or ctx.sandbox is None:
+    if not targets or ctx.sandbox is None:
         return {}
 
     sandbox = ctx.sandbox
@@ -1160,11 +1195,14 @@ async def _rerun_failing_tests_against_base(ctx, nodeids: list[str]) -> dict[str
     results: dict[str, bool] = {}
     try:
         await asyncio.to_thread(git_repo.checkout, sandbox, git_repo.BASE_BRANCH)
-        for nodeid in nodeids:
+        for file_path, test_name in targets:
+            args: dict = {"test_name": test_name}
+            if file_path:
+                args["path"] = file_path
             outcome = await invoke_tool(
-                "run_tests", {"path": nodeid}, ctx, agent_name="orchestrator"
+                "run_tests", args, ctx, agent_name="orchestrator"
             )
-            results[nodeid] = bool(
+            results[test_name] = bool(
                 outcome.success and outcome.output and outcome.output.get("failed", 0) > 0
             )
     finally:

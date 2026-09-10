@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -653,11 +654,12 @@ def _parse_jest_json(json_text: str) -> dict:
         "Run the repository's test suite inside the sandbox (pytest for "
         "Python repos, Jest for JavaScript) and return structured "
         "results. Optionally pass 'path' to run only the tests at that "
-        "path. Does not modify any source file."
+        "path, and/or 'test_name' to run only tests matching that name. "
+        "Does not modify any source file."
     ),
     parameters={
         "type": "object",
-        "properties": {"path": {"type": "string"}},
+        "properties": {"path": {"type": "string"}, "test_name": {"type": "string"}},
         "required": [],
     },
     # Non-mutating: executing a test suite observes the code's behavior,
@@ -668,7 +670,9 @@ def _parse_jest_json(json_text: str) -> dict:
     mutating=False,
     timeout_seconds=310,
 )
-async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
+async def run_tests(
+    ctx: ToolContext, path: str | None = None, test_name: str | None = None
+) -> ToolResult:
     if ctx.sandbox is None:
         return ToolResult(
             success=False,
@@ -698,18 +702,40 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
     # before the sandbox is even created -- see indexer.py) and passed
     # in as plain data, same D-8 pattern as permission_overrides. Python
     # path below is byte-for-byte the pre-Milestone-25 command.
+    # Milestone 26: selecting ONE test is runner-specific, and getting it
+    # wrong is dangerous rather than merely broken. Before this, callers
+    # built a pytest nodeid (`file::test_name`) and passed it as `path`.
+    # pytest understands that natively; Jest does not -- it takes
+    # positional args as path regexes, so the `::name` suffix made the
+    # path resolve to /workspace and Jest silently ran the ENTIRE SUITE.
+    # The orchestrator's flaky-test carve-out
+    # (_rerun_failing_tests_against_base) then read "the whole suite
+    # fails on base" as "this individual test fails on base too",
+    # excluded the real failure as environmental noise, and forced
+    # all_passed=True on a red suite. Name filtering therefore goes
+    # through each runner's own flag, never through the path.
+    name_filter = ""
+    if test_name:
+        # -k (pytest) / -t (jest). Both take the name as a pattern, so a
+        # name containing regex/expression metacharacters could still
+        # over-match -- acceptable here because the caller uses this to
+        # re-check a test it already knows failed, and an over-match can
+        # only make the re-run look MORE failing, which the fail-safe
+        # default already treats as "not conclusively flaky".
+        flag = "-t" if ctx.stack in JEST_STACKS else "-k"
+        name_filter = f" {flag} {shlex.quote(test_name)}"
 
     if ctx.stack in JEST_STACKS:
         report_path = f"/tmp/amop-jest-{uuid.uuid4().hex}.json"
         jest_target = "" if target == "." else f" {target}"
         command = (
             f"cd /workspace && jest --json --testLocationInResults "
-            f"--outputFile={report_path}{jest_target}"
+            f"--outputFile={report_path}{jest_target}{name_filter}"
         )
     else:
         report_path = f"/tmp/amop-junit-{uuid.uuid4().hex}.xml"
         command = (
-            f"cd /workspace && python -m pytest {target} "
+            f"cd /workspace && python -m pytest {target}{name_filter} "
             f"--junit-xml={report_path} -q"
         )
     try:

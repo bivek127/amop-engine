@@ -251,6 +251,151 @@ async def test_jest_runs_the_tsx_fixture_at_its_documented_baseline(
     assert failure["file"].endswith("CartSummary.test.tsx")
 
 
+# =======================================================================
+# The flaky-test carve-out bug found by this milestone's live run.
+#
+# _rerun_failing_tests_against_base re-runs each failing test against
+# the base branch; anything that fails there too is discarded as
+# environmental noise. It used to select that test with a pytest nodeid
+# (`file::test_name`) passed as a *path*. Jest has no such selector --
+# the `::name` suffix made the path resolve to /workspace and Jest ran
+# the ENTIRE SUITE. For a seeded-bug fixture the whole suite always
+# fails on base, so the one real failure was discarded as noise and
+# all_passed was forced True on a red suite: the chain reporting success
+# while the bug it was asked to fix was demonstrably still present.
+#
+# The property that must hold, on every runner: selecting one test runs
+# exactly one test.
+# =======================================================================
+
+
+@pytest.mark.parametrize(
+    "fixture_name,stack,file_path,test_name",
+    [
+        (
+            "buggy_react_cart",
+            "typescript",
+            "/workspace/src/CartSummary.test.tsx",
+            "renders no count element at all for an empty cart",
+        ),
+        (
+            "buggy_js_calculator",
+            "javascript",
+            "/workspace/calculator.test.js",
+            "average of three numbers",
+        ),
+        ("buggy_calculator", "python", None, "test_average_of_three_numbers"),
+    ],
+)
+async def test_selecting_one_test_runs_exactly_one_test(
+    tmp_path, sandbox_manager, fixture_name, stack, file_path, test_name
+):
+    """Exactly one, on all three runners -- not "at least one" and not
+    "the suite still fails". Before the fix these ran 6 (typescript, the
+    dangerous case), 0 (javascript, harmless only because the fail-safe
+    default caught it), and 1 (python, correct because `file::name` is
+    pytest's own native selector)."""
+    shutil.copytree(
+        Path(__file__).parent / "fixtures" / fixture_name, tmp_path, dirs_exist_ok=True
+    )
+    sandbox = sandbox_manager.create("t-m26-isolate", tmp_path, stack=stack)
+    try:
+        ctx = ToolContext(
+            agent_name="orchestrator",
+            scratch_dir=tmp_path,
+            mode="operator",
+            sandbox=sandbox,
+            stack=stack,
+        )
+        kwargs = {"test_name": test_name}
+        if file_path:
+            kwargs["path"] = file_path
+        result = await run_tests(ctx, **kwargs)
+    finally:
+        sandbox_manager.destroy("t-m26-isolate")
+
+    assert result.success is True
+    assert result.output["passed"] + result.output["failed"] == 1
+    assert result.output["failed"] == 1  # it's a known-failing test on all three
+
+
+async def test_the_carveout_annotates_but_never_flips_a_red_suite_green(
+    tmp_path, sandbox_manager
+):
+    """The severe half of this milestone's live-run finding, pinned on a
+    Jest stack (M4 pins the same invariant on pytest).
+
+    `_run_tester` used to end with `all_passed = all_passed or not
+    effective`, letting the base-branch carve-out manufacture a green
+    verdict. In a bug_fix task the base branch IS the unfixed code, so
+    the bug's own failing test always fails on base and always looked
+    like environmental noise -- meaning a chain that fixed nothing could
+    report the suite passing. Here nothing is fixed at all, so every
+    failure fails on base: `all_passed` must still be False, and the
+    carve-out's observation must appear in `details` rather than in the
+    verdict."""
+    from amop.agents import tester as tester_mod
+    from amop.models.base import BaseLLM, ModelResponse
+    from amop.orchestrator.chain import ChainResult, _run_tester
+    from amop.orchestrator.state_machine import TaskState
+    from amop.sandbox import repo as git_repo
+
+    class ScriptedLLM(BaseLLM):
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = 0
+
+        async def complete(self, messages, tools=None):
+            content = self._responses[min(self.calls, len(self._responses) - 1)]
+            self.calls += 1
+            return ModelResponse(content=content, model="scripted")
+
+        async def embed(self, texts):
+            raise NotImplementedError
+
+    shutil.copytree(FIXTURE, tmp_path, dirs_exist_ok=True)
+    sandbox = sandbox_manager.create("t-m26-carveout", tmp_path, stack="typescript")
+    try:
+        git_repo.init_baseline(sandbox)
+        git_repo.create_branch(sandbox, "amop/fix-carveout")
+
+        ctx = ToolContext(
+            agent_name="chain",
+            scratch_dir=tmp_path,
+            mode="operator",
+            sandbox=sandbox,
+            stack="typescript",
+        )
+        # The Tester model claims everything is fine; ground truth (and
+        # the carve-out) must both refuse to agree.
+        tester_agent = tester_mod.TesterAgent(
+            ScriptedLLM(
+                [
+                    '{"final_answer": {"all_passed": true, '
+                    '"details": "looks green to me", "new_tests_added": [], '
+                    '"regression_confirmed": false}}'
+                ]
+            ),
+            ctx,
+        )
+        report = await _run_tester(
+            tester_agent,
+            ctx,
+            task_id="m26-carveout",
+            chain_result=ChainResult(task=None, final_state=TaskState.TESTING),
+            # A natural-language report, like every real one AMOP gets --
+            # it does NOT contain the failing test's name, which is
+            # exactly why is_carveout_protected could not protect it.
+            description="the cart shows a stray 0 when it is empty",
+        )
+    finally:
+        sandbox_manager.destroy("t-m26-carveout")
+
+    assert report.all_passed is False
+    # The observation is still reported -- it just doesn't decide anything.
+    assert "base branch" in report.details
+
+
 async def test_the_seeded_bug_is_actually_fixable(tmp_path, sandbox_manager):
     """A fixture whose bug can't be fixed would make every live run a
     false negative. Applies the known-good one-line fix and confirms the
