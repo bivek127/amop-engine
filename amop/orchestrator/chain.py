@@ -49,6 +49,7 @@ from amop.agents.reviewer import ReviewerAgent
 from amop.agents.tester import TesterAgent
 from amop.codebase_intel.indexer import detect_stack, index_repo
 from amop.database.models import PullRequest, Task
+from amop.models.router import ModelRouter
 from amop.memory import store as memory_store
 from amop.orchestrator.state_machine import TERMINAL_STATES, TRANSITIONS, TaskState
 from amop.orchestrator.counterexample import (
@@ -372,12 +373,32 @@ class ChainAgents:
     reviewer: Any
 
     @classmethod
-    def build(cls, model, ctx: ToolContext, task_id: str) -> "ChainAgents":
+    def build(
+        cls, model, ctx: ToolContext, task_id: str, router=None
+    ) -> "ChainAgents":
+        """`router` (spec 11.2) optionally gives individual agents a
+        different provider -- Section 5.5's per-agent model table, which
+        until now had never been wired to anything because every agent
+        received this same single `model` instance.
+
+        An agent the router does NOT override keeps that instance,
+        rather than getting a freshly-built default. That matters: the
+        passed-in `model` carries the operator's own `--model` choice,
+        so routing un-overridden agents through the router would quietly
+        discard it. With `router=None` every agent gets `model`, exactly
+        as before -- so every existing caller and test is unchanged.
+        """
+
+        def for_agent(agent_name: str):
+            if router is not None and router.is_overridden(agent_name):
+                return router.build(agent_name)
+            return model
+
         return cls(
-            investigator=InvestigatorAgent(model, ctx),
-            coder=CoderAgent(model, ctx, task_id=task_id),
-            tester=TesterAgent(model, ctx),
-            reviewer=ReviewerAgent(model, ctx),
+            investigator=InvestigatorAgent(for_agent("investigator"), ctx),
+            coder=CoderAgent(for_agent("coder"), ctx, task_id=task_id),
+            tester=TesterAgent(for_agent("tester"), ctx),
+            reviewer=ReviewerAgent(for_agent("reviewer"), ctx),
         )
         
 @dataclass
@@ -1443,7 +1464,22 @@ async def run_fix(
             task_id=task.id,
             stack=stack,
         )
-        agents = ChainAgents.build(model, ctx, task_id)
+        # Section 11.2: per-agent providers, opt-in via config/env. With
+        # no overrides set this resolves to exactly the previous
+        # behavior (every agent on `model`), so a normal local run is
+        # unchanged.
+        router = ModelRouter(emit=emit)
+        overrides = router.overrides()
+        if overrides:
+            # Announced at the top of the run, before any call: this is
+            # the moment real spend can begin, and it should never start
+            # silently.
+            emit(
+                "PAID MODEL IN USE: "
+                + ", ".join(f"{a}={p}" for a, p in sorted(overrides.items()))
+                + f" (fallback: {router.fallback_provider})"
+            )
+        agents = ChainAgents.build(model, ctx, task_id, router=router)
         emit(f"Sandbox container: {sandbox.short_id}")
         emit(f"Workspace: {scratch_dir}")
         result = await run_chain(
