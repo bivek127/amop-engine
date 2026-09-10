@@ -52,3 +52,26 @@ async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        for statement in _ADDITIVE_COLUMNS:
+            await conn.execute(text(statement))
+
+
+# create_all() creates missing TABLES; it never alters an existing one.
+# So a column added to a model after its table already exists is simply
+# absent from any database created earlier -- and the failure mode is
+# nasty: the model claims the column, every INSERT naming it errors, and
+# only on the older database. These statements close that gap.
+#
+# ADD COLUMN IF NOT EXISTS is idempotent, so this is a no-op on a fresh
+# database (create_all already made the column) and a one-time fix on an
+# existing one. That keeps both converged with no manual step and no
+# fresh-clone-vs-dev-database divergence.
+#
+# This is the "until the schema needs to evolve" moment init_db's own
+# docstring anticipated. It is deliberately limited to ADDITIVE,
+# nullable columns: anything that rewrites or drops data belongs in a
+# real migration tool, not here.
+_ADDITIVE_COLUMNS = (
+    "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS input_tokens INTEGER",
+    "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS output_tokens INTEGER",
+)

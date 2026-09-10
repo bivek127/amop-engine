@@ -21,12 +21,14 @@ Two Section 5.1 pieces arrive with it:
 """
 
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from amop.models.base import BaseLLM
+from amop.audit.actions import record_model_call
 from amop.tools.registry import ToolContext, all_tools, invoke_tool
 
 RESPONSE_FORMAT_INSTRUCTIONS = (
@@ -120,6 +122,36 @@ class BaseAgent(ABC):
             {"role": "user", "content": prompt},
         ]
 
+    async def _complete_and_record(self, messages: list[dict]):
+        """One model call, with its token usage written to the audit
+        trail (spec 11.3) instead of thrown away.
+
+        Providers have always captured `input_tokens`/`output_tokens`;
+        until now this loop discarded them, which is why Section 20.1's
+        tokens-per-task metric had nothing to aggregate and
+        `estimated_cost_usd` stayed permanently NULL. Recording happens
+        here, in the one place every agent's completions funnel through,
+        rather than at each of the three call sites below -- a fourth
+        call site added later gets the accounting for free.
+
+        The write never raises (see audit/actions.py) and never blocks
+        the completion: a run must not fail because its bookkeeping did.
+        """
+        started = time.monotonic()
+        response = await self.model.complete(messages)
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        if self.ctx is not None:
+            await record_model_call(
+                self.ctx,
+                agent_name=self.name,
+                model=response.model,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                latency_ms=latency_ms,
+            )
+        return response
+
     def handoff_instructions(self) -> str:
         """Render this agent's handoff schema into prompt text. Derived
         from the pydantic model itself so the instructions can never
@@ -156,7 +188,7 @@ class BaseAgent(ABC):
 
         for iteration in range(1, self.loop_limit + 1):
             try:
-                response = await self.model.complete(messages)
+                response = await self._complete_and_record(messages)
             except Exception as exc:
                 return AgentResult(
                     success=False,
@@ -183,7 +215,7 @@ class BaseAgent(ABC):
                     }
                 )
                 try:
-                    response = await self.model.complete(messages)
+                    response = await self._complete_and_record(messages)
                 except Exception as exc:
                     return AgentResult(
                         success=False,
@@ -233,7 +265,7 @@ class BaseAgent(ABC):
                         }
                     )
                     try:
-                        response = await self.model.complete(messages)
+                        response = await self._complete_and_record(messages)
                         messages.append(
                             {"role": "assistant", "content": response.content}
                         )

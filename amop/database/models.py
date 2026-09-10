@@ -338,6 +338,19 @@ class AgentAction(Base):
     decision_reason: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     estimated_cost_usd: Mapped[float | None] = mapped_column(Numeric)
+    # Spec 11.3: "Every complete() call logs {input_tokens,
+    # output_tokens, estimated_cost_usd} to agent_actions... what Section
+    # 20's cost-per-task metric aggregates." Populated on model-call rows
+    # (tool_name == MODEL_CALL_TOOL_NAME), NULL on ordinary tool-call
+    # rows, which is what lets one table carry both without either
+    # metric contaminating the other.
+    #
+    # Deliberately NOT part of the hashed chain content (see
+    # audit/chain.py's _agent_action_content): adding a field to what is
+    # hashed would change the digest of every row already written and
+    # make an intact chain verify as BROKEN.
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

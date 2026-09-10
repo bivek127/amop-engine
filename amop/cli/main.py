@@ -1204,5 +1204,73 @@ def serve_telegram() -> None:
     bot_main()
 
 
+
+@app.command()
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+@click.option(
+    "--scenarios",
+    default=None,
+    help="Comma-separated scenario names (default: the whole suite).",
+)
+@click.option(
+    "--repeat",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Run each scenario N times and report the spread (a single pass is not a measurement).",
+)
+@click.option(
+    "--output", default=None, help="Write the report to this file as well as stdout."
+)
+def evaluate(model: str, scenarios: str | None, repeat: int, output: str | None) -> None:
+    """Run the benchmark suite and report real, ground-truth metrics."""
+    names = [s.strip() for s in scenarios.split(",")] if scenarios else None
+    asyncio.run(_evaluate(model, names, repeat, output))
+
+
+async def _evaluate(
+    model: str, names: list[str] | None, repeat: int, output: str | None
+) -> None:
+    from amop.evaluation.runner import run_suite
+    from amop.evaluation.scenarios import select
+
+    selected = select(names)
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    click.echo(
+        f"Evaluating {len(selected)} scenario(s) x {repeat} run(s) "
+        f"= {len(selected) * repeat} chain runs, model: {model}"
+    )
+    click.echo(
+        "Each scenario runs a real chain, then its fixture's own suite is "
+        "re-run to score it.\n"
+    )
+
+    async with session_factory() as session:
+        report = await run_suite(
+            session,
+            selected,
+            model=OllamaProvider(model=model),
+            model_name=model,
+            repeat=repeat,
+            emit=lambda message: click.echo(f"  {message}"),
+        )
+
+    rendered = report.render()
+    click.echo()
+    click.echo(rendered)
+
+    if output:
+        Path(output).write_text(rendered + "\n")
+        click.echo(f"\nSaved to {output}")
+
+    await engine.dispose()
+
+
 if __name__ == "__main__":
     app()
+

@@ -123,6 +123,13 @@ async def run_dependency_update(
             sandbox=sandbox,
             repo_path=str(Path(repo_path).resolve()),
             db_session=session,
+            # Without this, every agent_actions row this orchestrator
+            # writes lands with a NULL task_id -- unattributable to the
+            # task that caused it, and invisible to any per-task query.
+            # The bug_fix chain has always passed it; these two never
+            # did, so their audit rows have been orphaned since the
+            # table was introduced.
+            task_id=task.id,
             permission_overrides=await load_permission_overrides(
                 session, str(Path(repo_path).resolve())
             ),
