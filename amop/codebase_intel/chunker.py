@@ -1,9 +1,18 @@
 """Chunking — spec Section 7.2, Design Decision D-5. Milestone 5 scoped
-this to Python-only via the stdlib `ast` module; Milestone 25 adds a
-second backend (tree-sitter + tree-sitter-javascript) for `.js`,
-dispatched by file extension in `chunk_source`. Each backend produces
-the same `Chunk` shape, so nothing downstream (indexer, embedding,
-search) needs to know which language a chunk came from.
+this to Python-only via the stdlib `ast` module; Milestone 25 added a
+second backend (tree-sitter + tree-sitter-javascript) for `.js`;
+Milestone 26 extends that same backend to `.ts` and `.tsx`, dispatched
+by file extension in `chunk_source`. Each backend produces the same
+`Chunk` shape, so nothing downstream (indexer, embedding, search) needs
+to know which language a chunk came from.
+
+Three tree-sitter grammars, not one, and the split is load-bearing
+rather than cosmetic: `tree-sitter-typescript` ships `typescript` and
+`tsx` as separate grammars because `<T>` is genuinely ambiguous between
+a type assertion and a JSX element. Verified rather than assumed --
+a real `.tsx` source parses clean under the tsx grammar and reports
+has_error under the typescript one (pinned as a test in
+test_milestone26.py).
 
 D-5's rule: a chunk boundary follows the AST, never a fixed token window
 and never a mid-function cut -- "the single most common cause of
@@ -22,13 +31,25 @@ code would silently never be indexed at all. Both backends produce it.
 
 import ast
 from dataclasses import dataclass
+from pathlib import Path
 
 import tree_sitter
 import tree_sitter_javascript
+import tree_sitter_typescript
 
 CHUNK_MAX_TOKENS = 800
 
 _JS_LANGUAGE = tree_sitter.Language(tree_sitter_javascript.language())
+_TS_LANGUAGE = tree_sitter.Language(tree_sitter_typescript.language_typescript())
+_TSX_LANGUAGE = tree_sitter.Language(tree_sitter_typescript.language_tsx())
+
+# extension -> the grammar that actually parses it. `.tsx` MUST use the
+# tsx grammar: the typescript grammar reports has_error on real JSX.
+_TREE_SITTER_GRAMMARS = {
+    ".js": _JS_LANGUAGE,
+    ".ts": _TS_LANGUAGE,
+    ".tsx": _TSX_LANGUAGE,
+}
 
 
 def _estimate_tokens(text: str) -> int:
@@ -114,10 +135,12 @@ def chunk_source(source: str, file_path: str) -> list[Chunk]:
     ever call this for extensions they've already decided to index, so
     an unrecognized extension reaching here is a caller bug, not a
     file to skip silently."""
-    if file_path.endswith(".py"):
+    suffix = Path(file_path).suffix
+    if suffix == ".py":
         return _chunk_python(source, file_path)
-    if file_path.endswith(".js"):
-        return _chunk_javascript(source, file_path)
+    language = _TREE_SITTER_GRAMMARS.get(suffix)
+    if language is not None:
+        return _chunk_tree_sitter(source, file_path, language)
     raise ValueError(f"chunk_source: unsupported file extension: {file_path!r}")
 
 
@@ -173,12 +196,21 @@ def _chunk_python(source: str, file_path: str) -> list[Chunk]:
     return chunks
 
 
-# --- JavaScript backend (Milestone 25) -------------------------------
+# --- tree-sitter backend: JS (Milestone 25), TS/TSX (Milestone 26) ----
+#
+# One backend, three grammars. Milestone 26 generalized what was the
+# JavaScript-only backend rather than adding a parallel one: the node
+# types TypeScript adds (interface/type-alias/enum/abstract-class) are
+# additions to the same top-level set, and every other rule -- export
+# unwrapping, class splitting, the leftover "module" chunk, line-number
+# conversion -- is identical across all three. The `.js` path is
+# unchanged by this generalization (pinned by Milestone 25's tests still
+# passing untouched).
 #
 # tree-sitter is error-tolerant by design -- it always returns *some*
 # tree, marking bad regions as error nodes rather than raising. To keep
 # chunk_source's contract identical across backends (SyntaxError on
-# unparseable source, not a best-effort partial chunk set), a JS parse
+# unparseable source, not a best-effort partial chunk set), a parse
 # whose root reports has_error is turned into an explicit SyntaxError
 # here, mirroring _chunk_python's propagation exactly.
 #
@@ -189,33 +221,59 @@ def _chunk_python(source: str, file_path: str) -> list[Chunk]:
 # 1-indexed inclusive convention: start_point.row + 1 / end_point.row +
 # 1 gives exactly the right bounds, same as ast's lineno/end_lineno.
 
-_JS_TOP_LEVEL_TYPES = {"function_declaration", "class_declaration", "lexical_declaration"}
+# Declarations that become their own chunk when they appear at the top
+# level (or wrapped in `export`). The first three are JS; the rest are
+# TypeScript-only. `abstract_class_declaration` is a genuinely separate
+# node type from `class_declaration` -- found by probing the real
+# grammar, not assumed, and easy to miss precisely because the source
+# text differs by one keyword.
+_TOP_LEVEL_TYPES = {
+    "function_declaration",
+    "class_declaration",
+    "lexical_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+}
+
+# Declaration node type -> the symbol_type recorded on its Chunk. Types
+# absent here are handled specially (functions carry async/arrow
+# distinctions; classes may split per-method).
+_DECLARATION_SYMBOL_TYPES = {
+    "interface_declaration": "interface",
+    "type_alias_declaration": "type_alias",
+    "enum_declaration": "enum",
+}
+
+_CLASS_TYPES = {"class_declaration", "abstract_class_declaration"}
 
 
-def _js_span(node: "tree_sitter.Node") -> tuple[int, int]:
+def _ts_span(node: "tree_sitter.Node") -> tuple[int, int]:
     return node.start_point.row + 1, node.end_point.row + 1
 
 
-def _js_is_async(node: "tree_sitter.Node") -> bool:
+def _ts_is_async(node: "tree_sitter.Node") -> bool:
     return any(c.type == "async" for c in node.children)
 
 
-def _js_unwrap_export(node: "tree_sitter.Node") -> "tree_sitter.Node | None":
-    """`export function foo() {}` / `export default class {}` wrap the
-    real declaration as a child. Unwrapping it lets exported and
-    non-exported top-level forms dispatch identically below. `export {
-    a, b }` (re-export list) and `export default <expression>` (e.g. an
-    anonymous arrow function) have no function/class/lexical child to
-    unwrap to -- returns None, and the caller leaves those lines to fall
-    into the leftover "module" chunk, same as any other top-level
-    statement chunk_source doesn't specifically recognize."""
+def _ts_unwrap_export(node: "tree_sitter.Node") -> "tree_sitter.Node | None":
+    """`export function foo() {}` / `export default class {}` /
+    `export interface Props {}` wrap the real declaration as a child.
+    Unwrapping it lets exported and non-exported top-level forms
+    dispatch identically below. `export { a, b }` (re-export list) and
+    `export default <expression>` (e.g. an anonymous arrow function)
+    have no recognized declaration child to unwrap to -- returns None,
+    and the caller leaves those lines to fall into the leftover "module"
+    chunk, same as any other top-level statement chunk_source doesn't
+    specifically recognize."""
     for child in node.children:
-        if child.type in _JS_TOP_LEVEL_TYPES:
+        if child.type in _TOP_LEVEL_TYPES:
             return child
     return None
 
 
-def _chunk_js_class(
+def _chunk_ts_class(
     node: "tree_sitter.Node",
     file_path: str,
     lines: list[str],
@@ -249,7 +307,7 @@ def _chunk_js_class(
             member_name_node = member.child_by_field_name("name")
             if member_name_node is None:
                 continue
-            m_start, m_end = _js_span(member)
+            m_start, m_end = _ts_span(member)
             chunks.append(
                 Chunk(
                     file_path=file_path,
@@ -263,10 +321,13 @@ def _chunk_js_class(
     return chunks
 
 
-def _chunk_javascript(source: str, file_path: str) -> list[Chunk]:
-    """Chunk one JavaScript file via tree-sitter. Raises SyntaxError on
-    unparseable source, matching _chunk_python's contract exactly."""
-    parser = tree_sitter.Parser(_JS_LANGUAGE)
+def _chunk_tree_sitter(
+    source: str, file_path: str, language: "tree_sitter.Language"
+) -> list[Chunk]:
+    """Chunk one JS/TS/TSX file via tree-sitter, using the grammar the
+    caller selected by extension. Raises SyntaxError on unparseable
+    source, matching _chunk_python's contract exactly."""
+    parser = tree_sitter.Parser(language)
     tree = parser.parse(source.encode("utf-8"))
     if tree.root_node.has_error:
         raise SyntaxError(f"tree-sitter reported a parse error in {file_path!r}")
@@ -276,10 +337,10 @@ def _chunk_javascript(source: str, file_path: str) -> list[Chunk]:
     covered_lines: set[int] = set()
 
     for node in tree.root_node.children:
-        outer_start, outer_end = _js_span(node)
+        outer_start, outer_end = _ts_span(node)
         target = node
         if node.type == "export_statement":
-            unwrapped = _js_unwrap_export(node)
+            unwrapped = _ts_unwrap_export(node)
             if unwrapped is None:
                 continue
             target = unwrapped
@@ -292,7 +353,7 @@ def _chunk_javascript(source: str, file_path: str) -> list[Chunk]:
                 Chunk(
                     file_path=file_path,
                     symbol_name=name_node.text.decode("utf-8"),
-                    symbol_type="async_function" if _js_is_async(target) else "function",
+                    symbol_type="async_function" if _ts_is_async(target) else "function",
                     start_line=outer_start,
                     end_line=outer_end,
                     content=_slice_source(lines, outer_start, outer_end),
@@ -300,8 +361,28 @@ def _chunk_javascript(source: str, file_path: str) -> list[Chunk]:
             )
             covered_lines.update(range(outer_start, outer_end + 1))
 
-        elif target.type == "class_declaration":
-            chunks.extend(_chunk_js_class(target, file_path, lines, outer_start, outer_end))
+        elif target.type in _CLASS_TYPES:
+            chunks.extend(_chunk_ts_class(target, file_path, lines, outer_start, outer_end))
+            covered_lines.update(range(outer_start, outer_end + 1))
+
+        elif target.type in _DECLARATION_SYMBOL_TYPES:
+            # TypeScript-only: interface / type alias / enum. These are
+            # whole-declaration chunks with no interior split -- an
+            # interface has no method bodies to split on, and a type
+            # alias is a single expression however long it gets.
+            name_node = target.child_by_field_name("name")
+            if name_node is None:
+                continue
+            chunks.append(
+                Chunk(
+                    file_path=file_path,
+                    symbol_name=name_node.text.decode("utf-8"),
+                    symbol_type=_DECLARATION_SYMBOL_TYPES[target.type],
+                    start_line=outer_start,
+                    end_line=outer_end,
+                    content=_slice_source(lines, outer_start, outer_end),
+                )
+            )
             covered_lines.update(range(outer_start, outer_end + 1))
 
         elif target.type == "lexical_declaration":
@@ -323,7 +404,7 @@ def _chunk_javascript(source: str, file_path: str) -> list[Chunk]:
                 if name_node is None:
                     continue
                 found_function = True
-                if _js_is_async(value):
+                if _ts_is_async(value):
                     symbol_type = "async_function"
                 elif value.type == "arrow_function":
                     symbol_type = "arrow_function"

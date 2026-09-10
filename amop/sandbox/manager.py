@@ -62,6 +62,11 @@ DOCKERFILE_DIR = Path(__file__).parent
 STACK_IMAGES = {
     "python": (IMAGE_NAME, "Dockerfile"),
     "javascript": (NODE_IMAGE_NAME, "Dockerfile.node"),
+    # Milestone 26: TypeScript deliberately maps to the SAME Node image
+    # rather than a third one -- TS/TSX need the same runtime plus a
+    # transform, not a different runtime, so a separate image would be
+    # duplication with no isolation or tooling benefit.
+    "typescript": (NODE_IMAGE_NAME, "Dockerfile.node"),
 }
 
 CPU_LIMIT = float(os.environ.get("AMOP_SANDBOX_CPU_LIMIT", "1"))

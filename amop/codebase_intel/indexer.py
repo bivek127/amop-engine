@@ -40,7 +40,18 @@ _ALWAYS_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".v
 # framework/manifest sniffing (package.json dependency inspection) is
 # explicitly out of scope per CLAUDE.md's Milestone 25 scope decisions;
 # this milestone only needs "is this repo Python or JavaScript."
-_LANGUAGE_EXTENSIONS = {".py": "python", ".js": "javascript"}
+_LANGUAGE_EXTENSIONS = {
+    ".py": "python",
+    ".js": "javascript",
+    # Milestone 26: `.ts` and `.tsx` are one *language* here even though
+    # chunker.py parses them with two different grammars -- the grammar
+    # split (`<T>` is ambiguous between a type assertion and a JSX
+    # element) is a parsing detail, not a stack detail. Both run in the
+    # same Node sandbox image, so collapsing them keeps image selection
+    # honest and simple.
+    ".ts": "typescript",
+    ".tsx": "typescript",
+}
 
 # Milestone 8: chunker.py's own CHUNK_MAX_TOKENS=800 budget is only
 # enforced on classes (splitting an over-budget class into one chunk per

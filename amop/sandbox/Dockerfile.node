@@ -21,6 +21,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends procps git \
 # pytest either).
 RUN npm install -g jest
 
+# TypeScript/JSX toolchain (Milestone 26), baked in for the same
+# network_mode="none" reason as jest above. Jest cannot run .ts/.tsx
+# natively -- without a transform it dies on the first `import` with
+# "Cannot use import statement outside a module" (verified against the
+# Milestone 25 image before this was added). babel-jest + these three
+# presets are what strip types and compile JSX; react/react-dom are the
+# runtime the fixture's components and renderToStaticMarkup need.
+#
+# Deliberately NOT installed: typescript/tsc. Type-CHECKING is a
+# separate, much larger feature (a real compiler integration, not a
+# grammar extension) and is explicitly out of scope -- see
+# ROADMAP.md's queued TypeScript entry. This milestone strips types to
+# RUN the code; it never type-checks it.
+RUN npm install -g \
+      babel-jest @babel/core \
+      @babel/preset-env @babel/preset-typescript @babel/preset-react \
+      react react-dom
+
+# Global npm modules are NOT on node's resolution path by default --
+# /usr/local/lib/node_modules is absent from require.resolve.paths(),
+# so a fixture's `import * as React from "react"` would fail even though
+# react is installed. Milestone 25 never hit this because jest was only
+# ever invoked as a *binary*, needing no module resolution from the
+# project directory. Verified empirically: with this set, both node's
+# require() and Jest's own resolver find global modules.
+#
+# Babel is the exception and does not honor it -- babel resolves presets
+# relative to its config file, so fixtures reference presets by absolute
+# path (see the fixture's babel.config.js and its comment).
+ENV NODE_PATH=/usr/local/lib/node_modules
+
 # Non-root user inside the container (Section 9.3's isolation table).
 # Same fixed uid as the Python image (sandbox/manager.py's
 # CONTAINER_UID) -- host-side code chowns file writes to it without

@@ -23,6 +23,7 @@ dependencies = [
     "python-telegram-bot[job-queue]",
     "tree-sitter",
     "tree-sitter-javascript",
+    "tree-sitter-typescript",
 ]
 
 [project.optional-dependencies]

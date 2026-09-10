@@ -36,6 +36,16 @@ SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 # registry's wrapper doesn't fire before the sandbox's kill path does.
 TEST_TIMEOUT_SECONDS = float(os.environ.get("AMOP_TEST_TIMEOUT_SECONDS", "300"))
 
+# Stacks whose tests run under Jest rather than pytest (Section 8.6's
+# runner-agnostic contract). This is a SET, not an equality check
+# against "javascript", specifically because Milestone 26 added
+# "typescript" as its own detected stack: an `== "javascript"` test
+# would have silently fallen through and run *pytest* against a
+# TypeScript repo -- failing in a confusing, far-downstream way rather
+# than at the dispatch. Any future stack that runs Jest joins this set;
+# nothing else needs to change.
+JEST_STACKS = frozenset({"javascript", "typescript"})
+
 
 def _container_path(target: Path, scratch_dir: Path) -> str:
     relative = target.relative_to(scratch_dir.resolve())
@@ -688,7 +698,8 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
     # before the sandbox is even created -- see indexer.py) and passed
     # in as plain data, same D-8 pattern as permission_overrides. Python
     # path below is byte-for-byte the pre-Milestone-25 command.
-    if ctx.stack == "javascript":
+
+    if ctx.stack in JEST_STACKS:
         report_path = f"/tmp/amop-jest-{uuid.uuid4().hex}.json"
         jest_target = "" if target == "." else f" {target}"
         command = (
@@ -717,7 +728,7 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
 
     try:
         report_text = await asyncio.to_thread(ctx.sandbox.read_file, report_path)
-        if ctx.stack == "javascript":
+        if ctx.stack in JEST_STACKS:
             summary = _parse_jest_json(report_text)
         else:
             summary = _parse_junit_xml(report_text)
@@ -726,7 +737,7 @@ async def run_tests(ctx: ToolContext, path: str | None = None) -> ToolResult:
         # no tests found, no config file, ...). Surface the raw output
         # as evidence instead of pretending we got a clean zero-failure
         # result.
-        runner_name = "jest" if ctx.stack == "javascript" else "pytest"
+        runner_name = "jest" if ctx.stack in JEST_STACKS else "pytest"
         return ToolResult(
             success=False,
             error_code="NO_TEST_REPORT",
