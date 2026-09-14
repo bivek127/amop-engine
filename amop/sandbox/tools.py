@@ -27,6 +27,7 @@ from pathlib import Path
 
 from amop.safety.engine import resolve_within_scratch
 from amop.sandbox import repo
+from amop.sandbox.repo import GitError
 from amop.tools.registry import ToolContext, ToolResult, tool
 
 SCRATCH_DIR = Path(os.environ.get("AMOP_SCRATCH_DIR", "./amop_workspace")).resolve()
@@ -284,6 +285,38 @@ async def read_file(
 _SUSPICIOUS_SHRINK_RATIO = 0.20
 
 
+async def _micro_commit_after_edit(
+    ctx: ToolContext, tool_name: str, path: str, success_output: str
+) -> str:
+    """Spec 4.6.1 / D-15: called right after write_file/patch_file's own
+    edit has already succeeded, never before -- this can only make a
+    real edit MORE durable, never gate whether the edit happened.
+
+    Skips quietly (returns success_output unchanged) when there's no
+    task_id to attribute the commit to -- the same "plenty of call
+    sites legitimately have no X" convention audit/actions.py uses for
+    a missing db_session, not an error.
+
+    On a commit failure (e.g. a stale index lock), spec 4.6.1 is
+    explicit: "the tool result reports success-with-warning rather
+    than failing the edit -- the edit did happen; losing durability is
+    worse than a failed tool call but not worth discarding correct
+    work over." The warning is appended to the tool's own success
+    output rather than a new ToolResult field, since output is already
+    the human/model-visible outcome and every other tool's contract
+    stays unchanged.
+    """
+    if ctx.task_id is None or ctx.sandbox is None:
+        return success_output
+    try:
+        await asyncio.to_thread(
+            repo.micro_commit, ctx.sandbox, str(ctx.task_id), tool_name, path
+        )
+    except GitError as exc:
+        return f"{success_output} (warning: micro-commit failed: {exc})"
+    return success_output
+
+
 @tool(
     name="write_file",
     description=(
@@ -351,7 +384,10 @@ async def write_file(path: str, content: str, ctx: ToolContext) -> ToolResult:
         await asyncio.to_thread(ctx.sandbox.write_file, container_path, content)
     except Exception as exc:
         return ToolResult(success=False, error_code="WRITE_ERROR", message=str(exc))
-    return ToolResult(success=True, output=f"wrote {len(content)} bytes to {path}")
+    output = await _micro_commit_after_edit(
+        ctx, "write_file", path, f"wrote {len(content)} bytes to {path}"
+    )
+    return ToolResult(success=True, output=output)
 
 
 def _normalize_diff_headers(diff: str, relative_path: str) -> str:
@@ -557,7 +593,10 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
     finally:
         await asyncio.to_thread(ctx.sandbox.exec_run, f"rm -f {patch_path}")
 
-    return ToolResult(success=True, output=f"applied patch to {path}")
+    output = await _micro_commit_after_edit(
+        ctx, "patch_file", path, f"applied patch to {path}"
+    )
+    return ToolResult(success=True, output=output)
 
 
 # ---------------------------------------------------------------------

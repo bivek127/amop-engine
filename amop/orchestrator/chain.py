@@ -835,6 +835,21 @@ async def run_chain(
         # not built this milestone; a human must review and merge the
         # real PR on GitHub themselves.
         await go(TaskState.PR_CREATION, actor=f"agent:{agents.reviewer.name}")
+
+        # Milestone 29 / spec 4.6.1: mandatory squash-before-PR. A task
+        # can cycle through CODING more than once (Reviewer rejections,
+        # Milestones 4/24), and every successful edit since baseline has
+        # been its own [AMOP][wip] micro-commit -- collapse all of that
+        # into one commit before the branch is ever pushed, so the PR's
+        # diff history is exactly what the Coder's own commit_all()
+        # would have produced on its own, not a pile of per-edit noise.
+        squashed_sha = await asyncio.to_thread(
+            git_repo.squash_wip_commits, ctx.sandbox, f"fix: {report.root_cause[:60]}"
+        )
+        if squashed_sha:
+            code_report = code_report.model_copy(update={"commit_sha": squashed_sha})
+        stage(f"PR_CREATION: squashed working history (commit {code_report.commit_sha})")
+
         result.diff = await _get_diff(ctx)
         stage("PR_CREATION: opening a real pull request on GitHub")
 

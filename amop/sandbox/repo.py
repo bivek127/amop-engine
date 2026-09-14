@@ -10,6 +10,29 @@ and a repo the agents mangle is a repo inside a disposable container.
 Spec Section 9.1's rationale for one container per task applies directly
 here: the branch Coder creates has to still be there when Tester and
 Reviewer look, without re-cloning.
+
+Milestone 29 / spec 4.6.1, 8.4, 12.2.1: micro-commits and hook-bypass.
+Every AMOP-initiated commit here runs with --no-verify, and
+core.hooksPath is pointed at an empty directory for the whole task --
+a repo's own .git/hooks/pre-commit would otherwise fire on every
+micro-commit, which is both a performance problem and a code-execution
+vector from a repo AMOP was only asked to read and patch. This is set
+once, in init_baseline(), before any commit (baseline or micro) can
+happen.
+
+Identity note, found while building this: spec 8.4 requires
+`amop-bot <amop-bot@localhost>` as commit author/committer -- but the
+sandbox image (Dockerfile) bakes in `AMOP Agent <agent@amop.local>`
+globally, and every existing commit (baseline, Coder's final commit)
+has used that identity since Milestone 6, not amop-bot. That drift
+predates this milestone and is out of Stage 1's scope to silently fix
+project-wide (it would touch the image and every prior commit's
+behavior, not just micro-commits). micro_commit() below applies the
+spec-correct amop-bot identity via `git -c user.name=... -c
+user.email=...`, scoped to that one invocation only -- so new
+micro-commits are spec-compliant without changing what identity
+existing baseline/final commits use. Flagged here and in the milestone
+findings rather than fixed silently.
 """
 
 import shutil
@@ -17,6 +40,25 @@ import subprocess
 from pathlib import Path
 
 from amop.sandbox.manager import Sandbox
+
+# spec 8.4's required identity for AMOP-authored commits. Applied via
+# `git -c` overrides on individual commit invocations (micro_commit,
+# squash_wip_commits) rather than the sandbox's global git config --
+# see this module's docstring for why the global identity is left
+# alone for now.
+BOT_NAME = "amop-bot"
+BOT_EMAIL = "amop-bot@localhost"
+
+# Where core.hooksPath points inside the sandbox -- a directory that is
+# guaranteed to exist and be empty, so no hook from the target repo (or
+# anywhere else) can ever fire on an AMOP-initiated commit.
+_EMPTY_HOOKS_DIR = "/tmp/amop-no-hooks"
+
+# spec 4.6.1: the mechanically-identifiable prefix on every micro-commit
+# message, used both to construct the message and, at squash time, to
+# find/verify no such commit survives onto a branch that reaches PR
+# creation.
+WIP_MARKER = "[AMOP][wip]"
 
 WORKSPACE = "/workspace"
 BASE_BRANCH = "main"
@@ -81,6 +123,12 @@ def init_baseline(sandbox: Sandbox) -> str:
     there instead of stomping a synthetic one on top of it. This changes
     nothing for the fixture-repo case (no fixture under tests/fixtures/
     has a .git), only for a real clone.
+
+    Milestone 29: also disarms the target repo's own git hooks for the
+    rest of this task, before any commit (including this baseline one)
+    can happen -- see module docstring for why (spec 4.6.1's hook-
+    execution risk, closing the surface Milestone 19 named but never
+    itself needed to touch).
     """
     already_a_repo = (
         sandbox.exec_run(
@@ -93,9 +141,12 @@ def init_baseline(sandbox: Sandbox) -> str:
     else:
         _git(sandbox, f"init -b {BASE_BRANCH}")
 
+    sandbox.exec_run(f"mkdir -p {_EMPTY_HOOKS_DIR}")
+    _git(sandbox, f"config core.hooksPath {_EMPTY_HOOKS_DIR}")
+
     if has_changes(sandbox):
         _git(sandbox, "add -A")
-        _git(sandbox, "commit -m 'baseline: fixture repo as seeded'")
+        _git(sandbox, "commit --no-verify -m 'baseline: fixture repo as seeded'")
     return current_sha(sandbox)
 
 
@@ -119,14 +170,100 @@ def has_changes(sandbox: Sandbox) -> bool:
 def commit_all(sandbox: Sandbox, message: str) -> str | None:
     """Stage everything and commit. Returns the new sha, or None if there
     was nothing to commit -- an agent that changed no files is a real
-    outcome the orchestrator has to handle, not an error to swallow."""
+    outcome the orchestrator has to handle, not an error to swallow.
+
+    Milestone 29: --no-verify like every other AMOP-initiated commit
+    (module docstring). Identity is deliberately NOT overridden here --
+    this is the existing final-commit path, and changing its author
+    identity is out of Stage 1's scope; see the identity note in the
+    module docstring."""
     if not has_changes(sandbox):
         return None
     _git(sandbox, "add -A")
     # -m via a quoted string: message is orchestrator-controlled, never
     # model-controlled, so there's no injection surface here.
-    _git(sandbox, f"commit -m {_shell_quote(message)}")
+    _git(sandbox, f"commit --no-verify -m {_shell_quote(message)}")
     return current_sha(sandbox)
+
+
+def micro_commit(sandbox: Sandbox, task_id: str, tool_name: str, path: str) -> str | None:
+    """Spec 4.6.1 / Design Decision D-15: commit one successful edit to
+    the working branch immediately, distinct from and prior to the
+    Coder's own deliberate commit_all() at handoff. This is what makes
+    a crash between a successful patch_file/write_file and the end-of-
+    turn commit durable -- resume re-clones the working branch (4.6),
+    which now has the edit, instead of silently losing it while
+    agent_messages/agent_actions still shows the edit as applied.
+
+    Returns the new sha, or None if the edit produced no net diff (a
+    patch that changed nothing real) -- mirrors commit_all()'s own
+    skip-on-empty-diff behavior.
+
+    Author/committer is amop-bot <amop-bot@localhost> (spec 8.4),
+    applied via `git -c` on this one invocation only -- see the module
+    docstring's identity note for why the sandbox's global git identity
+    is left alone.
+
+    Raises GitError if the commit itself fails (e.g. a stale index
+    lock) -- deliberately NOT swallowed here. Spec 4.6.1: "the tool
+    result reports success-with-warning rather than failing the edit,"
+    which is a decision only the caller (write_file/patch_file, which
+    knows the edit itself already succeeded) can make. Swallowing the
+    error in this low-level function would make that policy invisible
+    and untestable at the point that actually needs it.
+    """
+    if not has_changes(sandbox):
+        return None
+    message = f"{WIP_MARKER}[{task_id}] {tool_name}: {path}"
+    _git(sandbox, "add -A")
+    _git(
+        sandbox,
+        f"-c user.name={BOT_NAME} -c user.email={BOT_EMAIL} "
+        f"commit --no-verify -m {_shell_quote(message)}",
+    )
+    return current_sha(sandbox)
+
+
+def squash_wip_commits(sandbox: Sandbox, message: str) -> str | None:
+    """Collapse every commit since the branch's merge-base with
+    BASE_BRANCH into one, right before the branch is ever pushed.
+
+    Spec 4.6.1: micro-commits "are squashed/rebased away before PR
+    creation... so they never appear in the final diff history" --
+    "Mandatory squash-before-PR: a task reaching PR_CREATION with any
+    unsquashed [wip] commit still present is a bug, not a style
+    preference."
+
+    Uses the merge-base with BASE_BRANCH rather than a remembered
+    baseline sha: create_branch() always branches off BASE_BRANCH, so
+    the merge-base IS the baseline commit, and this stays correct
+    regardless of how many micro-commits or intermediate commit_all()
+    calls happened in between (a task can cycle through CODING more
+    than once across Reviewer rejections -- Milestones 4/24 -- so the
+    real commit count since baseline is not always 1).
+
+    Returns the new (squashed) sha, or None if there was nothing to
+    squash (branch HEAD already equals the merge-base -- no commits
+    were made at all, e.g. a no-op Coder attempt).
+    """
+    base_sha = _git(sandbox, f"merge-base {BASE_BRANCH} HEAD").strip()
+    if current_sha(sandbox) == base_sha:
+        return None
+    _git(sandbox, f"reset --soft {base_sha}")
+    _git(
+        sandbox,
+        f"-c user.name={BOT_NAME} -c user.email={BOT_EMAIL} "
+        f"commit --no-verify -m {_shell_quote(message)}",
+    )
+    return current_sha(sandbox)
+
+
+def has_wip_commits(sandbox: Sandbox, base: str = BASE_BRANCH) -> bool:
+    """True if any commit since `base` still carries the micro-commit
+    marker -- the acceptance-test hook for "no unsquashed [wip] commit
+    survives into PR_CREATION" (spec 4.6.1, Section 27)."""
+    log = _git(sandbox, f"log {base}..HEAD --format=%s")
+    return any(WIP_MARKER in line for line in log.splitlines())
 
 
 def diff_against_baseline(sandbox: Sandbox, base: str = BASE_BRANCH) -> str:
