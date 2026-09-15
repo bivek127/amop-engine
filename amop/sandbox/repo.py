@@ -396,3 +396,111 @@ def push_to_remote(
         raise GitError(
             f"git push failed (exit {result.returncode}): {result.stderr.strip()}"
         )
+
+
+def fetch_remote_branch_sha(
+    host_scratch_dir: Path, remote_url: str, branch: str, timeout: float = 30.0
+) -> str | None:
+    """Milestone 29 / spec 4.6.2: what's actually on the remote for
+    `branch`, right now -- from the host, mirroring push_to_remote's
+    reasoning exactly (the sandbox runs network_mode="none", so this
+    can't happen from inside the container).
+
+    Uses `git ls-remote`, not a real clone/fetch: RECONCILE only needs
+    to know whether the branch exists remotely and what sha it's at,
+    not its content -- a full fetch would be slower and would pull
+    objects nothing here needs.
+
+    Returns None if the branch doesn't exist on the remote at all
+    (spec 4.6.2's "otherwise the branch exists only in the destroyed
+    container" case), never raises for that -- a missing branch is an
+    expected, common outcome (this project never pushes before
+    PR_CREATION, so any task reconciled before reaching it will
+    legitimately have no remote branch), not an error.
+
+    Same token-masking obligation as push_to_remote: callers must not
+    let `remote_url` reach a ToolResult/log line unmasked.
+    """
+    result = subprocess.run(
+        ["git", "ls-remote", remote_url, branch],
+        cwd=host_scratch_dir,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise GitError(
+            f"git ls-remote failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    line = result.stdout.strip()
+    if not line:
+        return None
+    # `ls-remote` output is "<sha>\t<ref>" per matching ref; only one ref
+    # should ever match an exact branch name.
+    return line.split()[0]
+
+
+def git_fsck(sandbox: Sandbox) -> bool:
+    """Milestone 29 / spec 4.6.2 case F: `git fsck` on resume. True if
+    the repo passes integrity checking; False if it reports any
+    corruption. AMOP does not attempt automated repair of a corrupted
+    repository (spec's own words) -- this function only detects, the
+    caller (reconcile.py) decides what to do with a False result
+    (NEEDS_HUMAN_INPUT, reason repo_integrity_failure)."""
+    result = sandbox.exec_run(f"cd {WORKSPACE} && git fsck --no-dangling")
+    return result.exit_code == 0
+
+
+# ---------------------------------------------------------------------
+# Milestone 29 / spec 4.6.2 case A vs. case D: when a stranded task's
+# real HEAD is ahead of the sha its DB row last recorded, RECONCILE
+# (orchestrator/reconcile.py) has to tell "more of AMOP's own work
+# landed before the crash" (case A -- adopt it) apart from "a human
+# touched this branch" (case D -- never auto-resolve). The spec
+# distinguishes these by diffing against the remote; nothing is ever
+# pushed before PR_CREATION in this codebase (github.py's
+# push_to_remote is only called from create_pull_request), so for a
+# task stranded in CODING/TESTING there is no remote copy to diff
+# against -- only the surviving host-mounted scratch dir. Commit
+# authorship is the substitute signal: every AMOP-initiated commit
+# anywhere in this codebase carries one of exactly two identities
+# (micro_commit's amop-bot, or the sandbox image's baked-in "AMOP
+# Agent" -- Dockerfile, used by commit_all/init_baseline), so a commit
+# author outside that set is, by construction, not something AMOP
+# wrote.
+_KNOWN_AMOP_IDENTITIES = frozenset({BOT_EMAIL, "agent@amop.local"})
+
+
+def commit_exists(sandbox: Sandbox, sha: str) -> bool:
+    """True if `sha` names a real commit object in this repo. Used for
+    case B's detection: a DB-recorded commit_sha that isn't even a
+    commit in the repo is unambiguously "the branch is missing the
+    edit", spec 4.6.2's own words for case B."""
+    result = sandbox.exec_run(f"cd {WORKSPACE} && git cat-file -e {sha}^{{commit}}")
+    return result.exit_code == 0
+
+
+def is_ancestor(sandbox: Sandbox, maybe_ancestor: str, descendant: str) -> bool:
+    """True if `maybe_ancestor` is on `descendant`'s own history (reachable
+    by walking descendant's first-parent-or-merge ancestry) -- including
+    the case where they're the same commit. False for both a genuine
+    non-ancestor and an unknown/missing revision (`git merge-base
+    --is-ancestor` exits non-zero, non-1 for the latter; RECONCILE only
+    needs the yes/no answer, and a missing revision is exactly the
+    "doesn't reach it" case B/D callers already treat non-ancestry as)."""
+    result = sandbox.exec_run(
+        f"cd {WORKSPACE} && git merge-base --is-ancestor {maybe_ancestor} {descendant}"
+    )
+    return result.exit_code == 0
+
+
+def branch_advanced_by_amop_only(sandbox: Sandbox, since_sha: str) -> bool:
+    """True if every commit strictly after `since_sha` on the current
+    branch (`since_sha..HEAD`) was authored under a known AMOP identity
+    -- see the module note above this function. Vacuously True if there
+    are no such commits (HEAD == since_sha or since_sha is not even an
+    ancestor of HEAD; callers only call this once ahead-ness is already
+    established)."""
+    log = _git(sandbox, f"log {since_sha}..HEAD --format=%ae")
+    authors = {line.strip() for line in log.splitlines() if line.strip()}
+    return authors <= _KNOWN_AMOP_IDENTITIES

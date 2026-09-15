@@ -123,11 +123,40 @@ _MILESTONE_9_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     ),
 }
 
+_MILESTONE_29_TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
+    # spec 4.6.2's RECONCILE, cases A/B/C: a task found stranded in
+    # CODING or TESTING (Milestone 16's own debt) is reset and resumed
+    # through the SAME single bounded re-entry point -- PLANNING_FIX,
+    # handed the recovered RootCauseReport -- regardless of which case
+    # applied. Case A/B still have real git work waiting on the branch;
+    # letting the Coder re-examine it fresh from PLANNING_FIX is safe
+    # (it will simply find the fix already correct), not wasteful, and
+    # avoids building a second, more surgical "resume straight into
+    # CODING mid-attempt" path this milestone doesn't need.
+    (TaskState.CODING, TaskState.PLANNING_FIX): (
+        "reconciliation: resuming from a recovered root cause (Section 4.6.2)"
+    ),
+    (TaskState.TESTING, TaskState.PLANNING_FIX): (
+        "reconciliation: resuming from a recovered root cause (Section 4.6.2)"
+    ),
+    # RECONCILE's own non-resumable outcomes (cases D/F, and the
+    # no_working_repo_recorded / root_cause_not_recorded prechecks) route
+    # a stranded task straight to NEEDS_HUMAN_INPUT. (CODING,
+    # NEEDS_HUMAN_INPUT) already exists via _MILESTONE_6_TRANSITIONS (the
+    # diff-size-cap edge) and RECONCILE reuses that edge rather than
+    # adding a second one for the same pair; TESTING has no such edge
+    # anywhere in the table before this, so it's added here.
+    (TaskState.TESTING, TaskState.NEEDS_HUMAN_INPUT): (
+        "reconciliation: could not safely resume (Section 4.6.2)"
+    ),
+}
+
 TRANSITIONS: dict[tuple[TaskState, TaskState], str] = {
     **_SPEC_TABLE_TRANSITIONS,
     **_CANCELLATION_TRANSITIONS,
     **_MILESTONE_6_TRANSITIONS,
     **_MILESTONE_9_TRANSITIONS,
+    **_MILESTONE_29_TRANSITIONS,
 }
 
 

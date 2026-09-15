@@ -63,6 +63,7 @@ from amop.orchestrator.concurrency import (
     repo_file_lock,
     try_repo_file_lock,
 )
+from amop.orchestrator.reconcile import reconcile
 from amop.orchestrator.task import transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
@@ -463,12 +464,21 @@ async def run_chain(
     ctx: ToolContext,
     agents: ChainAgents,
     emit: Callable[[str], None] = _noop,
+    resume_report: RootCauseReport | None = None,
 ) -> ChainResult:
     """Drive `task` through the real state machine using `agents`.
 
     Assumes a live sandbox on `ctx.sandbox` with the repo already
     materialized, git-initialized and on a working branch — see
     run_fix() for the lifecycle around this.
+
+    `resume_report`: Milestone 29 / spec 4.6.2. When set, `task` is
+    assumed to already be stranded in CODING or TESTING (RECONCILE's
+    job, not this function's, to have confirmed that) and this call
+    skips TRIAGING/INVESTIGATING entirely, re-entering at PLANNING_FIX
+    with this already-recovered RootCauseReport instead of running the
+    Investigator again. `description` is still required by the type but
+    unused on this path (no fresh investigation reads it).
     """
     result = ChainResult(task=task, final_state=TaskState(task.state))
     result.container_id = ctx.sandbox.short_id if ctx.sandbox else None
@@ -496,94 +506,137 @@ async def run_chain(
         emit(message)
 
     try:
-        # Milestone 9: a Watcher-created task is already put into TRIAGING
-        # by orchestrator/watch.py's triage_anomaly() before run_chain()
-        # is ever called (it has to be, to legally reach
-        # MERGED_INTO_EXISTING/CANCELLED, both only reachable FROM
-        # TRIAGING -- see state_machine.py's TRANSITIONS). There is no
-        # (TRIAGING, TRIAGING) self-transition, so calling go(TRIAGING)
-        # unconditionally here would raise IllegalTransitionError for
-        # every Watcher-sourced task. A CLI-driven `amop fix` task is
-        # still CREATED at this point exactly as before, so this is
-        # additive, not a behavior change for the existing path.
-        if TaskState(task.state) is TaskState.CREATED:
-            await go(TaskState.TRIAGING, actor="system")
-            stage("TRIAGING: bug report accepted, treating as novel")
-        else:
-            stage(
-                f"TRIAGING: already triaged by caller (state={task.state}) -- "
-                "dedup/severity checked upstream"
-            )
-        await go(TaskState.INVESTIGATING, actor="system")
-
-        # -- INVESTIGATING -------------------------------------------
-        # Section 10.3: retrieved once here, at task-context-construction
-        # time, and reused for the whole task -- not re-queried inside the
-        # agent's reasoning loop.
-        relevant_memory, memory_hits = await _retrieve_relevant_memory(ctx, description)
-        if memory_hits:
-            stage(
-                f"INVESTIGATING: injected {memory_hits} related past "
-                "incident(s) from memory as evidence"
-            )
-        stage("INVESTIGATING: investigator examining the repo")
-        report = await _run_agent(
-            agents.investigator,
-            _investigator_prompt(description, relevant_memory),
-            result,
-        )
-        report = _retag(report, str(task.id))
-        result.root_cause_report = report
-        stage(
-            f"INVESTIGATING: root cause -> {report.root_cause[:120]} "
-            f"(confidence {report.confidence:.2f}, "
-            f"affected {report.affected_files or '[]'})"
-        )
-
-        missing = missing_cited_files(report, ctx.scratch_dir)
-        uncited = has_no_citations(report)
-        if (
-            route_after_investigation(report, missing, uncited)
-            is TaskState.NEEDS_HUMAN_INPUT
-        ):
-            if uncited:
-                reason = (
-                    "investigator named no affected files "
-                    "(Section 6.2 evidence gap)"
-                )
-                detail = (
-                    "NEEDS_HUMAN_INPUT: the investigator could not name a single "
-                    "affected file — there is nothing for the coder to act on"
-                )
-            elif missing:
-                reason = (
-                    f"cited files do not exist in the repo: {missing} "
-                    "(Section 6.2 evidence gap)"
-                )
-                detail = (
-                    f"NEEDS_HUMAN_INPUT: the investigator cited {missing}, which "
-                    "does not exist in this repo — refusing to dispatch a fix "
-                    "for an imaginary file"
-                )
-            else:
-                reason = (
-                    f"confidence {report.confidence:.2f} < {CONFIDENCE_THRESHOLD} "
-                    "(Section 6.2 guardrail)"
-                )
-                detail = (
-                    f"NEEDS_HUMAN_INPUT: confidence {report.confidence:.2f} is below "
-                    f"{CONFIDENCE_THRESHOLD} — stopping rather than guessing at a fix"
-                )
+        if resume_report is not None:
+            # Milestone 29 / spec 4.6.2: RECONCILE already re-validated
+            # this task's real git/DB state and recovered its
+            # RootCauseReport (either the one persisted at INVESTIGATING
+            # time below, or a freshly re-derived one for a legacy row
+            # that predates that persistence). Re-running
+            # TRIAGING/INVESTIGATING here would be wasted work at best,
+            # and risks a second, possibly-different root cause for work
+            # that's already under way -- this task already has one.
+            # task.state is still whatever it was stranded in (CODING or
+            # TESTING); the single legal hop out of either is the
+            # (CODING|TESTING, PLANNING_FIX) edge state_machine.py adds
+            # for exactly this case, not a re-entry into a state the
+            # task already left once.
+            report = resume_report
+            result.root_cause_report = report
             await go(
-                TaskState.NEEDS_HUMAN_INPUT,
-                actor=f"agent:{agents.investigator.name}",
-                trigger=reason,
+                TaskState.PLANNING_FIX,
+                actor="system:reconcile",
+                trigger=(
+                    "reconciliation: resuming from a recovered root cause "
+                    "(Section 4.6.2)"
+                ),
             )
-            stage(detail)
-            return result
+            stage(
+                "PLANNING_FIX: resumed via reconciliation, root cause -> "
+                f"{report.root_cause[:120]}"
+            )
+        else:
+            # Milestone 9: a Watcher-created task is already put into TRIAGING
+            # by orchestrator/watch.py's triage_anomaly() before run_chain()
+            # is ever called (it has to be, to legally reach
+            # MERGED_INTO_EXISTING/CANCELLED, both only reachable FROM
+            # TRIAGING -- see state_machine.py's TRANSITIONS). There is no
+            # (TRIAGING, TRIAGING) self-transition, so calling go(TRIAGING)
+            # unconditionally here would raise IllegalTransitionError for
+            # every Watcher-sourced task. A CLI-driven `amop fix` task is
+            # still CREATED at this point exactly as before, so this is
+            # additive, not a behavior change for the existing path.
+            if TaskState(task.state) is TaskState.CREATED:
+                await go(TaskState.TRIAGING, actor="system")
+                stage("TRIAGING: bug report accepted, treating as novel")
+            else:
+                stage(
+                    f"TRIAGING: already triaged by caller (state={task.state}) -- "
+                    "dedup/severity checked upstream"
+                )
+            await go(TaskState.INVESTIGATING, actor="system")
 
-        await go(TaskState.PLANNING_FIX, actor=f"agent:{agents.investigator.name}")
-        stage("PLANNING_FIX: handing the root cause to the coder")
+            # -- INVESTIGATING -------------------------------------------
+            # Section 10.3: retrieved once here, at task-context-construction
+            # time, and reused for the whole task -- not re-queried inside the
+            # agent's reasoning loop.
+            relevant_memory, memory_hits = await _retrieve_relevant_memory(ctx, description)
+            if memory_hits:
+                stage(
+                    f"INVESTIGATING: injected {memory_hits} related past "
+                    "incident(s) from memory as evidence"
+                )
+            stage("INVESTIGATING: investigator examining the repo")
+            report = await _run_agent(
+                agents.investigator,
+                _investigator_prompt(description, relevant_memory),
+                result,
+            )
+            report = _retag(report, str(task.id))
+            result.root_cause_report = report
+            stage(
+                f"INVESTIGATING: root cause -> {report.root_cause[:120]} "
+                f"(confidence {report.confidence:.2f}, "
+                f"affected {report.affected_files or '[]'})"
+            )
+
+            # Milestone 29 / spec 4.6.2: a crashed task's RootCauseReport was
+            # never persisted before -- reproducing it meant re-running the
+            # Investigator from scratch even for cases (A/B) where a real fix
+            # attempt already exists on disk. Persisted here, at the one spot
+            # a validated report exists in every non-resumed run, so RECONCILE
+            # can hand it back in via resume_report above without ever needing
+            # its own separate write path.
+            task.task_context = {
+                **(task.task_context or {}),
+                "root_cause_report": report.model_dump(mode="json"),
+            }
+            session.add(task)
+            await session.commit()
+
+            missing = missing_cited_files(report, ctx.scratch_dir)
+            uncited = has_no_citations(report)
+            if (
+                route_after_investigation(report, missing, uncited)
+                is TaskState.NEEDS_HUMAN_INPUT
+            ):
+                if uncited:
+                    reason = (
+                        "investigator named no affected files "
+                        "(Section 6.2 evidence gap)"
+                    )
+                    detail = (
+                        "NEEDS_HUMAN_INPUT: the investigator could not name a single "
+                        "affected file — there is nothing for the coder to act on"
+                    )
+                elif missing:
+                    reason = (
+                        f"cited files do not exist in the repo: {missing} "
+                        "(Section 6.2 evidence gap)"
+                    )
+                    detail = (
+                        f"NEEDS_HUMAN_INPUT: the investigator cited {missing}, which "
+                        "does not exist in this repo — refusing to dispatch a fix "
+                        "for an imaginary file"
+                    )
+                else:
+                    reason = (
+                        f"confidence {report.confidence:.2f} < {CONFIDENCE_THRESHOLD} "
+                        "(Section 6.2 guardrail)"
+                    )
+                    detail = (
+                        f"NEEDS_HUMAN_INPUT: confidence {report.confidence:.2f} is below "
+                        f"{CONFIDENCE_THRESHOLD} — stopping rather than guessing at a fix"
+                    )
+                await go(
+                    TaskState.NEEDS_HUMAN_INPUT,
+                    actor=f"agent:{agents.investigator.name}",
+                    trigger=reason,
+                )
+                stage(detail)
+                return result
+
+            await go(TaskState.PLANNING_FIX, actor=f"agent:{agents.investigator.name}")
+            stage("PLANNING_FIX: handing the root cause to the coder")
 
         fix_iterations = 0
         review_cycles = 0
@@ -635,6 +688,38 @@ async def run_chain(
                 f"{code_report.files_changed or '[]'}"
                 + (" [no_op: no mutating tool call this attempt]" if code_report.no_op else "")
             )
+
+            # Milestone 29 / spec 4.6.2: RECONCILE's cases A/B need the DB
+            # to have recorded SOME prior commit_sha to compare a
+            # resumed branch's HEAD against -- nothing ever persisted
+            # this before (confirmed: commit_sha was computed, printed to
+            # stdout, and discarded). A merely-stale value here is fine,
+            # not a bug: case A's own remediation ("HEAD is ahead ->
+            # adopt it, no work lost") is exactly correct behavior for a
+            # DB record that's a few micro-commits behind real HEAD.
+            #
+            # Bugfix, found live by this milestone's own kill-mid-CODING
+            # demo: this used to read code_report.commit_sha, which is
+            # commit_all()'s return value inside _run_coder() -- None
+            # whenever the attempt's whole diff was already captured by
+            # Stage 1's own micro_commit(), leaving nothing for
+            # commit_all() to catch. That's not a rare shape, it's the
+            # common one (a single successful patch_file/write_file
+            # call), so the DB write was silently skipped on most real
+            # attempts. git_repo.current_sha(sandbox) is the real HEAD
+            # unconditionally -- correct whether this attempt's diff
+            # landed via a micro-commit, commit_all(), both, or (a
+            # genuine no_op) neither, in which case it's just the
+            # unchanged prior HEAD again, an idempotent, harmless write.
+            current_sha = await asyncio.to_thread(git_repo.current_sha, ctx.sandbox)
+            current_branch = await asyncio.to_thread(git_repo.current_branch, ctx.sandbox)
+            task.task_context = {
+                **(task.task_context or {}),
+                "branch": current_branch,
+                "commit_sha": current_sha,
+            }
+            session.add(task)
+            await session.commit()
 
             # Milestone 6, Section 29.1: diff-size cap, extending Section
             # 6.3.9's existing file-scope guard with a hard line-of-code
@@ -848,6 +933,21 @@ async def run_chain(
         )
         if squashed_sha:
             code_report = code_report.model_copy(update={"commit_sha": squashed_sha})
+            # Keep task_context's commit_sha in step with the squash --
+            # the CODING-loop write above records the pre-squash tip,
+            # which stops existing the moment squash_wip_commits rewrites
+            # history onto squashed_sha. Leaving the stale sha in the DB
+            # would make RECONCILE's case A/B git-vs-DB comparison see a
+            # commit that no longer exists on this branch for any task
+            # that reached PR_CREATION before crashing later (secret
+            # scan, diff cap, or the GitHub push/API step below).
+            task.task_context = {
+                **(task.task_context or {}),
+                "branch": code_report.branch,
+                "commit_sha": code_report.commit_sha,
+            }
+            session.add(task)
+            await session.commit()
         stage(f"PR_CREATION: squashed working history (commit {code_report.commit_sha})")
 
         result.diff = await _get_diff(ctx)
@@ -1502,5 +1602,119 @@ async def run_fix(
         )
         await _record_incident_memory(session, result, resolved_repo_path, emit)
         return result
+    finally:
+        await asyncio.to_thread(manager.destroy, task_id)
+
+
+@gated_by_task_slot
+async def resume_fix(
+    session: AsyncSession,
+    task: Task,
+    *,
+    model,
+    scratch_root: Path | None = None,
+    mode: str = "operator",
+    emit: Callable[[str], None] = _noop,
+) -> ChainResult:
+    """Milestone 29 / spec 4.6.2: the restart half of crash recovery --
+    run RECONCILE first, then (only if it says the task is safely
+    resumable) drive the rest of the chain for real via
+    run_chain(resume_report=...).
+
+    Mirrors run_fix()'s own shape (materialize/sandbox/ctx/agents/
+    teardown) with one deliberate difference: the equal/A/B/C-without-
+    fresh-checkout outcomes reuse the SURVIVING host_scratch_dir and its
+    already-checked-out branch exactly as the crash left them --
+    materialize()/init_baseline()/create_branch() would either
+    needlessly re-copy the pristine source over real (already-recovered)
+    work, or (init_baseline) re-run `git init`/rewrite hooksPath on a
+    repo that's already a real, git-initialized working branch. Only
+    case C (needs_fresh_checkout=True -- nothing survived) goes through
+    that full setup, identically to run_fix().
+
+    task_context['repo'] must already be set (reconcile() itself would
+    have routed a task with none to NEEDS_HUMAN_INPUT before this ever
+    runs) and task_context['prompt'] supplies the same `description`
+    run_chain's INVESTIGATING step would have used, had this been a
+    fresh run -- unused on the resume path itself (INVESTIGATING is
+    skipped) but kept for ChainResult/incident-memory consistency with
+    run_fix's own shape.
+    """
+    result = await reconcile(session, task, emit=emit)
+    if not result.resumable:
+        return ChainResult(
+            task=task, final_state=TaskState(task.state), error=result.detail
+        )
+
+    task_context = task.task_context or {}
+    repo_path = task_context.get("repo")
+    if not repo_path:
+        # reconcile() already guards this (no_working_repo_recorded), so
+        # a resumable result with no repo_path would itself be a bug --
+        # fail loudly rather than materializing from nothing.
+        raise RuntimeError(
+            f"reconcile() returned resumable=True for task {task.id} with no "
+            "task_context['repo'] -- this should be unreachable"
+        )
+    resolved_repo_path = str(Path(repo_path).resolve())
+
+    scratch_root = Path(scratch_root or sandbox_tools.SCRATCH_DIR)
+    scratch_dir = (scratch_root / str(task.id)).resolve()
+    task_id = str(task.id)
+    manager = await asyncio.to_thread(SandboxManager)
+
+    if result.needs_fresh_checkout:
+        emit(f"RESUME: case {result.case} -- no surviving state, clean checkout")
+        await asyncio.to_thread(git_repo.materialize, Path(repo_path), scratch_dir)
+    else:
+        emit(f"RESUME: case {result.case} -- reusing surviving scratch dir {scratch_dir}")
+
+    stack_info = await asyncio.to_thread(detect_stack, scratch_dir)
+    stack = stack_info["primary"] or "python"
+    emit(f"Detected stack: {stack_info['languages']} -> {stack}")
+    await _persist_detected_stack(session, resolved_repo_path, stack_info)
+
+    sandbox = await asyncio.to_thread(manager.create, task_id, scratch_dir, stack)
+    try:
+        if result.needs_fresh_checkout:
+            await asyncio.to_thread(git_repo.init_baseline, sandbox)
+            await asyncio.to_thread(
+                git_repo.create_branch, sandbox, f"amop/fix-{uuid.UUID(task_id).hex[:8]}"
+            )
+
+        chunk_count = await index_repo(session, resolved_repo_path, scratch_dir)
+        emit(f"Indexed {chunk_count} code chunks from {resolved_repo_path}")
+
+        overrides = await load_permission_overrides(session, resolved_repo_path)
+        ctx = ToolContext(
+            agent_name="chain",
+            scratch_dir=scratch_dir,
+            mode=mode,
+            sandbox=sandbox,
+            repo_path=resolved_repo_path,
+            db_session=session,
+            permission_overrides=overrides,
+            task_id=task.id,
+            stack=stack,
+        )
+        router = ModelRouter(emit=emit)
+        router_overrides = router.overrides()
+        if router_overrides:
+            emit(
+                "PAID MODEL IN USE: "
+                + ", ".join(f"{a}={p}" for a, p in sorted(router_overrides.items()))
+                + f" (fallback: {router.fallback_provider})"
+            )
+        agents = ChainAgents.build(model, ctx, task_id, router=router)
+        emit(f"Sandbox container: {sandbox.short_id}")
+        emit(f"Workspace: {scratch_dir}")
+        chain_result = await run_chain(
+            session, task,
+            description=task_context.get("prompt", ""),
+            ctx=ctx, agents=agents, emit=emit,
+            resume_report=result.report,
+        )
+        await _record_incident_memory(session, chain_result, resolved_repo_path, emit)
+        return chain_result
     finally:
         await asyncio.to_thread(manager.destroy, task_id)

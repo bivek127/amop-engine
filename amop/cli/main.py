@@ -14,7 +14,7 @@ from amop.database.models import MemoryItem
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
-from amop.orchestrator.chain import run_fix
+from amop.orchestrator.chain import resume_fix, run_fix
 from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
 from amop.orchestrator.optimize import MIN_IMPROVEMENT_PCT, run_optimization
 from amop.orchestrator.reporting import run_report
@@ -261,6 +261,68 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
     # (a low-confidence investigation, an oversized diff, a blocked/failed
     # PR creation) -- distinct from a hard FAILED/CANCELLED, so it gets
     # its own exit code rather than being lumped in with real failure.
+    if result.final_state in (TaskState.WAITING_FOR_APPROVAL, TaskState.RESOLVED):
+        pass
+    elif result.final_state is TaskState.NEEDS_HUMAN_INPUT:
+        sys.exit(2)
+    else:
+        sys.exit(1)
+
+
+@app.command()
+@click.argument("task_id")
+@click.option(
+    "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
+)
+@click.option(
+    "--mode",
+    default="operator",
+    show_default=True,
+    help="Permission mode for the run (Section 12.1).",
+)
+def resume(task_id: str, model: str, mode: str) -> None:
+    """Milestone 29 / spec 4.6.2: reconcile a task stranded by a crashed
+    orchestrator (CODING/TESTING, or any other non-terminal state), and
+    drive it the rest of the way if RECONCILE says it's safe to."""
+    asyncio.run(_resume(task_id, model, mode))
+
+
+async def _resume(task_id: str, model: str, mode: str) -> None:
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        task = await get_task(session, uuid.UUID(task_id))
+        if task is None:
+            click.echo(f"No task {task_id}", err=True)
+            sys.exit(1)
+        click.echo(f"Task {task.id}  (was: {task.state})")
+        click.echo()
+
+        provider = OllamaProvider(model=model)
+        result = await resume_fix(
+            session, task, model=provider, mode=mode,
+            emit=lambda message: click.echo(f"  {message}"),
+        )
+
+        task.task_context = {
+            **(task.task_context or {}),
+            "final_state": result.final_state.value,
+            "error": result.error,
+            "stages": result.stages,
+            "tool_calls": result.tool_calls,
+            "diff": result.diff,
+        }
+        session.add(task)
+        await session.commit()
+
+    click.echo()
+    if result.error:
+        click.echo(f"Error: {result.error}")
+    click.echo(f"Final state: {result.final_state.value}")
+    click.echo(f"Inspect the full history with:  amop status {task.id}")
+
     if result.final_state in (TaskState.WAITING_FOR_APPROVAL, TaskState.RESOLVED):
         pass
     elif result.final_state is TaskState.NEEDS_HUMAN_INPUT:

@@ -73,6 +73,32 @@ def _client(token: str) -> Github:
     return Github(auth=Auth.Token(token))
 
 
+async def find_open_pr_for_branch(
+    client: Github, head: str, base: str
+) -> dict | None:
+    """The exact lookup create_pull_request's own idempotency check
+    already does (spec 8.5.1: head branch name is the idempotency key),
+    factored out so Milestone 29's RECONCILE (spec 4.6.2 case E -- "a
+    real PR exists on GitHub with no local pull_requests row -> adopt
+    it, don't open a duplicate") can run the SAME query independently,
+    without needing to be ready to push/create a PR the way
+    create_pull_request is.
+
+    Returns {"url", "number"} if an open PR already exists for `head`,
+    None otherwise. Never creates anything -- read-only.
+    """
+    gh_repo = await asyncio.to_thread(client.get_repo, SANDBOX_REPO)
+    existing = await asyncio.to_thread(
+        lambda: list(
+            gh_repo.get_pulls(state="open", head=f"{_SANDBOX_OWNER}:{head}", base=base)
+        )
+    )
+    if not existing:
+        return None
+    pr = existing[0]
+    return {"url": pr.html_url, "number": pr.number}
+
+
 @tool(
     name="create_pull_request",
     description=(
@@ -154,22 +180,14 @@ async def create_pull_request(
 
     client = _client(token)
     try:
-        gh_repo = await asyncio.to_thread(client.get_repo, SANDBOX_REPO)
-
-        existing = await asyncio.to_thread(
-            lambda: list(
-                gh_repo.get_pulls(
-                    state="open", head=f"{_SANDBOX_OWNER}:{head}", base=base
-                )
-            )
-        )
-        if existing:
-            pr = existing[0]
+        found = await find_open_pr_for_branch(client, head, base)
+        if found is not None:
             return ToolResult(
                 success=True,
-                output={"url": pr.html_url, "number": pr.number, "created": False},
+                output={**found, "created": False},
             )
 
+        gh_repo = await asyncio.to_thread(client.get_repo, SANDBOX_REPO)
         pr = await asyncio.to_thread(
             gh_repo.create_pull, base=base, head=head, title=title, body=body
         )
