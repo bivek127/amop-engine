@@ -83,6 +83,22 @@ class ToolContext:
     # pre-Milestone-25 ToolContext(...) call site is unaffected.
     stack: str = "python"
 
+    # Milestone 30: the forced-fresh-read gate's own state -- path ->
+    # the (start_line, end_line) most recently actually SHOWN to the
+    # caller by a successful read_file call on that path, per
+    # sandbox/tools.py's read_file_effective_range(). None (the default)
+    # means the gate is OFF: every pre-Milestone-30 ToolContext(...)
+    # call site, and every test that calls patch_file directly without
+    # going through a real CoderAgent turn, is completely unaffected.
+    # CoderAgent.run() is the ONLY thing that ever turns this on (resets
+    # it to {} at the start of every real Coder attempt) -- deliberately
+    # not shared/meaningful across agents: an Investigator's read_file
+    # earlier in the same chain must never count as a Coder's own fresh
+    # read, since patch_file is never in any other agent's tool
+    # allowlist anyway, so the field is otherwise always just dead
+    # weight for them.
+    coder_read_tracking: dict[str, tuple[int, int]] | None = None
+
 
 @dataclass
 class ToolResult:

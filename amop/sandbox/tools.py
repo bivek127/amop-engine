@@ -99,6 +99,27 @@ def _large_file_notice(content: str, total_lines: int) -> str:
     )
 
 
+def _track_read(
+    ctx: ToolContext,
+    path: str,
+    start_line: int | None,
+    end_line: int | None,
+    result: "ToolResult",
+) -> None:
+    """Milestone 30: record what a successful read_file call actually
+    showed, for patch_file's forced-fresh-read gate. A no-op whenever
+    ctx.coder_read_tracking is None -- every call site outside a real
+    CoderAgent turn (see ToolContext's own docstring). Defined here,
+    ahead of read_file_effective_range's own definition further down in
+    this module, which is fine -- Python resolves the name at call
+    time, well after the whole module has finished loading."""
+    if ctx.coder_read_tracking is None:
+        return
+    rng = read_file_effective_range(start_line, end_line, result)
+    if rng is not None:
+        ctx.coder_read_tracking[path] = rng
+
+
 def _scoped_default_notice(size_bytes: int, total_lines: int, shown_lines: int) -> str:
     return (
         f"[NOTE: this file is {size_bytes} bytes / {total_lines} lines -- "
@@ -199,7 +220,9 @@ async def read_file(
             shown = lines[:_SCOPED_READ_DEFAULT_LINES]
             numbered = "".join(f"{i + 1}: {line}" for i, line in enumerate(shown))
             notice = _scoped_default_notice(size, total_lines, len(shown))
-            return ToolResult(success=True, output=notice + numbered)
+            result = ToolResult(success=True, output=notice + numbered)
+            _track_read(ctx, path, start_line, end_line, result)
+            return result
 
     try:
         content = await asyncio.to_thread(ctx.sandbox.read_file, container_path)
@@ -249,14 +272,19 @@ async def read_file(
                 body = "".join(f"{lo + i}: {line}" for i, line in enumerate(capped))
             else:
                 body = "".join(capped)
-            return ToolResult(success=True, output=notice + body)
+            result = ToolResult(success=True, output=notice + body)
+            _track_read(ctx, path, start_line, end_line, result)
+            return result
 
         if with_line_numbers:
-            return ToolResult(
+            result = ToolResult(
                 success=True,
                 output="".join(f"{lo + i}: {line}" for i, line in enumerate(selected)),
             )
-        return ToolResult(success=True, output="".join(selected))
+        else:
+            result = ToolResult(success=True, output="".join(selected))
+        _track_read(ctx, path, start_line, end_line, result)
+        return result
 
     total_lines = content.count("\n") + 1
     if with_line_numbers:
@@ -266,7 +294,9 @@ async def read_file(
     if len(content) > _LARGE_FILE_NOTICE_THRESHOLD:
         content = _large_file_notice(content, total_lines) + content
 
-    return ToolResult(success=True, output=content)
+    result = ToolResult(success=True, output=content)
+    _track_read(ctx, path, start_line, end_line, result)
+    return result
 
 
 # Milestone 13: found live in Milestone 12 -- Coder abandoned a
@@ -387,6 +417,11 @@ async def write_file(path: str, content: str, ctx: ToolContext) -> ToolResult:
     output = await _micro_commit_after_edit(
         ctx, "write_file", path, f"wrote {len(content)} bytes to {path}"
     )
+    # Milestone 30: content just changed -- any tracked read of this
+    # path is now stale, same reasoning as patch_file's own invalidation
+    # below. A no-op when tracking is off.
+    if ctx.coder_read_tracking is not None:
+        ctx.coder_read_tracking.pop(path, None)
     return ToolResult(success=True, output=output)
 
 
@@ -496,6 +531,121 @@ def _diagnose_context_mismatch(diff: str, current_content: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------
+# Milestone 30 / spec's diagnosis-vs-mechanical-output gap, attempt 2:
+# forced-fresh-read enforcement. Milestone 17 diagnosed the remaining
+# (phantom-context) failure precisely -- the real historical case
+# (task 09d7b2d1-b039-4e2f-9e9b-282bd2e4a2e5, still in amop_dev) shows
+# every retry WAS preceded by a same-turn read_file, always covering
+# lines 14-20; the diff's real target range was 14-23. A same-turn-read
+# PRESENCE check would have passed that case right through unchanged --
+# it has to be COVERAGE: does the most recent read of this path actually
+# span every old-file line the diff's hunks touch, not merely "was there
+# a read at all." This is what closes the gap Milestone 17 left open by
+# name ("force a fresh, immediately-preceding read_file of the exact
+# target region... never letting the Coder construct a diff against
+# content read several turns -- or a prior failed retry attempt --
+# earlier").
+#
+# Enforced entirely inside patch_file() below, gated on
+# ctx.coder_read_tracking being non-None (see ToolContext's own
+# docstring for why: off by default, on only for a real CoderAgent
+# turn) -- never a prompt instruction, never advisory.
+# ---------------------------------------------------------------------
+
+
+def _diff_target_range(diff: str) -> tuple[int, int] | None:
+    """The union of old-file line numbers (1-indexed, inclusive) this
+    diff's hunks touch -- reuses the exact same line-accounting walk
+    _diagnose_context_mismatch already does (old_line_no incremented
+    per context/removed line), extracted into its own function since
+    that one needs a real git-apply rejection and file content to
+    compare against, and this one runs BEFORE any application is
+    attempted, on the diff's own structure alone.
+
+    A pure-insertion hunk (only '+' lines, zero old-file lines
+    consumed) still touches its declared anchor position -- the point
+    the new lines are inserted after/before -- so that position alone
+    counts as the touched range for that hunk, not an empty range.
+
+    Returns None for a diff with no parseable '@@' header at all
+    (malformed input; let _normalize_diff_headers/git apply's own error
+    handling deal with that, this gate isn't the place to invent a
+    second error for it).
+    """
+    lines = diff.splitlines()
+    touched_min: int | None = None
+    touched_max: int | None = None
+    i = 0
+    while i < len(lines):
+        m = _HUNK_HEADER_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        hunk_start = int(m.group(1))
+        old_line_no = hunk_start
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@@ "):
+            line = lines[i]
+            i += 1
+            if not line or line[0] not in " -":
+                continue  # '+' lines don't consume an old-file line number
+            old_line_no += 1
+        hunk_end = max(old_line_no - 1, hunk_start)
+        touched_min = hunk_start if touched_min is None else min(touched_min, hunk_start)
+        touched_max = hunk_end if touched_max is None else max(touched_max, hunk_end)
+    if touched_min is None:
+        return None
+    return touched_min, touched_max
+
+
+# Same defaults read_file() itself falls back to when it silently
+# narrows a whole-file or oversized-range request (see that function,
+# above) -- reused here rather than re-derived, so "what range did the
+# caller actually get SHOWN" can never drift from what read_file itself
+# actually decided to return.
+_UNBOUNDED_END = 1_000_000_000
+
+
+def read_file_effective_range(
+    start_line: int | None, end_line: int | None, result: ToolResult
+) -> tuple[int, int] | None:
+    """What range of a file a read_file call actually SHOWED the caller,
+    given its arguments and the ToolResult it produced -- not always the
+    same as the range requested: a whole-file read on a large file, or
+    an oversized explicit range, gets silently narrowed to
+    _SCOPED_READ_DEFAULT_LINES (read_file's own behavior, unchanged by
+    this milestone). Crediting the requested-but-not-actually-shown
+    range would defeat the entire point of a FRESH-read requirement.
+
+    Returns None for a failed read (nothing was shown, so nothing should
+    be credited) or a non-string output (shouldn't happen for read_file,
+    defensive).
+    """
+    if not result.success or not isinstance(result.output, str):
+        return None
+    truncated = result.output.startswith("[NOTE:")
+    if start_line is None and end_line is None:
+        if truncated:
+            return 1, _SCOPED_READ_DEFAULT_LINES
+        return 1, _UNBOUNDED_END
+    lo = max(1, start_line or 1)
+    if truncated:
+        return lo, lo + _SCOPED_READ_DEFAULT_LINES - 1
+    hi = end_line if end_line is not None else _UNBOUNDED_END
+    return lo, hi
+
+
+def _read_covers_target(
+    read_range: tuple[int, int] | None, target_range: tuple[int, int]
+) -> bool:
+    if read_range is None:
+        return False
+    read_lo, read_hi = read_range
+    target_lo, target_hi = target_range
+    return read_lo <= target_lo and target_hi <= read_hi
+
+
 @tool(
     name="patch_file",
     description=(
@@ -541,6 +691,42 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
             error_code="SANDBOX_UNAVAILABLE",
             message="no sandbox session for this task",
         )
+
+    # Milestone 30: forced-fresh-read gate. Only active during a real
+    # CoderAgent turn (ctx.coder_read_tracking is not None -- see
+    # ToolContext's own docstring); every other caller, including every
+    # test that calls patch_file directly, is unaffected. Checked before
+    # touching the sandbox at all -- a stale-context attempt never
+    # reaches git apply, matching Milestone 17's own named fix: "reject
+    # it before it ever reaches git apply."
+    if ctx.coder_read_tracking is not None:
+        target_range = _diff_target_range(diff)
+        if target_range is not None:
+            read_range = ctx.coder_read_tracking.get(path)
+            if not _read_covers_target(read_range, target_range):
+                target_lo, target_hi = target_range
+                seen = (
+                    f"lines {read_range[0]}-{read_range[1]}"
+                    if read_range is not None
+                    else "no prior read_file call on this path this attempt"
+                )
+                return ToolResult(
+                    success=False,
+                    error_code="STALE_READ",
+                    message=(
+                        f"this diff touches lines {target_lo}-{target_hi} of "
+                        f"{path!r}, but the most recent read_file on it "
+                        f"covered {seen} -- that doesn't fully cover the "
+                        "diff's target range, so it was rejected before "
+                        "ever reaching git apply. Call read_file again with "
+                        f"start_line<={target_lo}, end_line>={target_hi} "
+                        "(with_line_numbers=true if you need exact line "
+                        "numbers for the '@@' header) to see the file's "
+                        "real, current content there, then construct a new "
+                        "diff against what you actually just saw."
+                    ),
+                )
+
     container_path = _container_path(target, ctx.scratch_dir)
     relative_path = container_path.removeprefix("/workspace/")
 
@@ -596,6 +782,13 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
     output = await _micro_commit_after_edit(
         ctx, "patch_file", path, f"applied patch to {path}"
     )
+    # Milestone 30: content just changed -- the tracked read is now
+    # stale relative to the new file content. Cleared rather than left
+    # around: a second patch_file on the same path later in this same
+    # attempt must re-read post-edit content, not reuse a pre-edit
+    # range that happened to numerically cover the new target too.
+    if ctx.coder_read_tracking is not None:
+        ctx.coder_read_tracking.pop(path, None)
     return ToolResult(success=True, output=output)
 
 

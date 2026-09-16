@@ -127,7 +127,18 @@ class CoderAgent(BaseAgent):
         owner. Standalone (Milestones 0/2/3, and the CLI's single-agent
         path) it creates and destroys its own container, always in
         `finally` so an exception can't leak one.
+
+        Milestone 30: (re)activates the forced-fresh-read gate fresh for
+        THIS attempt, every time -- ctx.coder_read_tracking = {} here,
+        not merely at __init__. ctx is the SAME long-lived object the
+        whole chain shares (Investigator/Tester/Reviewer included), and
+        this same CoderAgent instance is reused across retry attempts
+        within one task (chain.py's CODING loop), each a fresh
+        conversation via a fresh run() call -- a stale range tracked
+        from an earlier attempt's now-irrelevant messages must never
+        silently satisfy this attempt's own gate.
         """
+        self.ctx.coder_read_tracking = {}
         if self.ctx.sandbox is not None:
             self.last_container_id = self.ctx.sandbox.short_id
             return await self._run_loop(prompt)

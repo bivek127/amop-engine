@@ -451,7 +451,21 @@ async def test_coder_can_apply_a_patch_mid_loop(workspace):
         f"{body}"
     )
 
-    llm = ScriptedLLM([tool_call("patch_file", path="calculator.py", diff=diff), final("done")])
+    llm = ScriptedLLM(
+        [
+            # Milestone 30's forced-fresh-read gate: patch_file now
+            # requires a same-attempt read_file covering the diff's
+            # target range first -- a real CoderAgent turn (this is one,
+            # via coder.run() below) always tracks it, unlike direct
+            # invoke_tool() calls elsewhere in this file.
+            tool_call(
+                "read_file", path="calculator.py",
+                start_line=start, end_line=start + 1,
+            ),
+            tool_call("patch_file", path="calculator.py", diff=diff),
+            final("done"),
+        ]
+    )
     coder = CoderAgent(llm, ctx, task_id="t1")
 
     result = await coder.run("fix the average() off-by-one bug")
