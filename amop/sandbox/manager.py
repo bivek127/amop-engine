@@ -38,6 +38,7 @@ pre-installed tool-belt differ.
 
 import io
 import os
+import shutil
 import tarfile
 import threading
 import time
@@ -100,10 +101,20 @@ class Sandbox:
     """One task's ephemeral container. Constructed only by
     SandboxManager.create() — never directly."""
 
-    def __init__(self, container: Container, task_id: str) -> None:
+    def __init__(
+        self, container: Container, task_id: str, host_scratch_dir: Path | None = None
+    ) -> None:
         self.container = container
         self.task_id = task_id
         self.created_at = time.monotonic()
+        # Milestone 31: known only from here on (create() below is the
+        # only real construction site) so destroy() can remove the
+        # host-side bind-mount directory alongside the container --
+        # previously nothing ever did, the actual leak Milestone 25
+        # named ("bigger and older" than the container-leak finding).
+        # None for a Sandbox built any other way (there isn't one today,
+        # but this keeps the constructor's old two-arg shape valid).
+        self.host_scratch_dir = host_scratch_dir
 
     @property
     def id(self) -> str:
@@ -321,7 +332,7 @@ class SandboxManager:
             init=True,
             labels={TASK_LABEL: task_id},
         )
-        sandbox = Sandbox(container, task_id)
+        sandbox = Sandbox(container, task_id, host_scratch_dir=host_scratch_dir)
         self._sandboxes[task_id] = sandbox
         return sandbox
 
@@ -337,7 +348,7 @@ class SandboxManager:
             return None
         return sandbox
 
-    def destroy(self, task_id: str) -> None:
+    def destroy(self, task_id: str, remove_scratch_dir: bool = False) -> None:
         sandbox = self._sandboxes.pop(task_id, None)
         if sandbox is None:
             return
@@ -345,6 +356,42 @@ class SandboxManager:
             sandbox.container.remove(force=True)
         except docker.errors.NotFound:
             pass
+        # Milestone 31: the host-side bind-mount directory going
+        # forward -- previously nothing ever removed it, leaving
+        # amop_workspace/<task_id> behind on every single task regardless
+        # of how cleanly it ended (Milestone 25's own "bigger and older"
+        # finding, ~100+ directories by the time it was named).
+        #
+        # Opt-IN (default False), not opt-out -- found necessary, not
+        # assumed: the first version of this defaulted to True, and a
+        # full-suite run immediately broke a wide, legitimate pattern
+        # across this project's own tests (test_milestone14.py and
+        # others) of calling a real orchestrator function
+        # (run_dependency_update, run_optimization, ...) and THEN
+        # reading its scratch dir's real file content afterward to
+        # verify the outcome directly, rather than trusting a self-
+        # report -- exactly the discipline this project holds everywhere
+        # else. Nothing in real production use needs a normal task's
+        # scratch dir to survive its own run_fix()/resume_fix() call
+        # returning (the diff is already in Postgres, a PR is already
+        # pushed) -- but plenty of tests legitimately do, so the real
+        # production entry points (run_fix, resume_fix,
+        # run_optimization, run_dependency_update) opt in explicitly at
+        # their own `finally: manager.destroy(task_id, remove_scratch_
+        # dir=True)` call sites; every other caller, including every
+        # test that constructs its own sandbox directly, is unaffected
+        # unless it explicitly asks for this too.
+        #
+        # reconcile.py's own inspection sandbox stays explicitly False
+        # for a different, sharper reason: that scratch dir belongs to
+        # the task, not to reconcile's own throwaway container, and the
+        # whole point of reconciling is that a LATER step (run_chain's
+        # resume) still needs it to exist. ignore_errors: a caller that
+        # already cleaned this up by hand, or a task whose scratch dir a
+        # human deliberately wants to keep inspecting, must not turn a
+        # normal destroy() into a crash.
+        if remove_scratch_dir and sandbox.host_scratch_dir is not None:
+            shutil.rmtree(sandbox.host_scratch_dir, ignore_errors=True)
 
     def destroy_all(self) -> None:
         for task_id in list(self._sandboxes):

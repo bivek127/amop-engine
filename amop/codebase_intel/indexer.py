@@ -25,7 +25,7 @@ import warnings
 from pathlib import Path
 
 import pathspec
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from amop.codebase_intel.chunker import Chunk, _estimate_tokens, chunk_source
@@ -229,3 +229,69 @@ async def index_repo(
         )
     await session.commit()
     return len(all_chunks)
+
+
+# ---------------------------------------------------------------------
+# Milestone 31: stale code_chunks pruning (Milestone 20's own logged
+# debt -- rows under a dead path from before the amop-engine rename).
+#
+# Staleness needs two signals together, not `repositories` membership
+# alone: a real, currently-used fixture path (e.g. tests/fixtures/
+# buggy_react_cart) is legitimately never registered there at all --
+# Milestone 20's registry is for Watcher-monitored repos, not every ad-
+# hoc `amop fix --repo` target -- and index_repo() above already
+# deletes-and-repopulates that path's rows on every real run anyway, so
+# staleness only actually matters for a path nothing will ever index
+# again. Checked directly against this project's own real dev database
+# before deciding this: `repositories` membership alone would have
+# flagged buggy_react_cart/buggy_js_calculator's real, current chunks
+# for deletion right alongside the genuinely dead pre-rename path --
+# a path still real on disk is never stale, registered or not.
+# ---------------------------------------------------------------------
+
+
+async def find_stale_code_chunk_paths(session: AsyncSession) -> list[tuple[str, int]]:
+    """repo_path groups in code_chunks that are neither a currently-
+    registered repo (Milestone 20's `repositories` table) NOR a real
+    directory on disk right now -- genuinely dead, not merely
+    unregistered or temporarily unavailable. Returns (repo_path,
+    row_count) pairs, most rows first. Read-only; deletion is a
+    separate, explicit step (prune_stale_code_chunks below)."""
+    from amop.database.models import Repository
+
+    registered = {
+        row[0]
+        for row in (await session.execute(select(Repository.repo_path))).all()
+    }
+    counts = (
+        await session.execute(
+            select(CodeChunk.repo_path, func.count())
+            .group_by(CodeChunk.repo_path)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    stale = []
+    for repo_path, count in counts:
+        if repo_path in registered:
+            continue
+        if Path(repo_path).is_dir():
+            continue
+        stale.append((repo_path, count))
+    return stale
+
+
+async def prune_stale_code_chunks(session: AsyncSession, repo_paths: list[str]) -> int:
+    """Delete every code_chunks row for each of `repo_paths`. Returns
+    rows deleted. Trusts its caller to have already confirmed staleness
+    (via find_stale_code_chunk_paths, shown to a human as a dry run) --
+    this function does not re-derive staleness itself, so it can also
+    be pointed at a specific, deliberately-chosen path if ever needed,
+    without fighting its own judgment."""
+    total = 0
+    for repo_path in repo_paths:
+        result = await session.execute(
+            delete(CodeChunk).where(CodeChunk.repo_path == repo_path)
+        )
+        total += result.rowcount or 0
+    await session.commit()
+    return total

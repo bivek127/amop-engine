@@ -471,9 +471,35 @@ async def test_real_model_chain_fixes_the_seeded_bug_using_search(session, tmp_p
     assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
     assert result.code_change_report.files_changed == ["priority.py"]
 
-    workspace = tmp_path / str(task.id)
-    fixed_source = (workspace / "priority.py").read_text()
-    assert "/ effort" not in fixed_source  # the division bug is gone
+    # Milestone 31: run_fix() now removes its scratch dir on return
+    # (SandboxManager.destroy(..., remove_scratch_dir=True)), so this
+    # can no longer re-read the file from disk afterward. result.diff is
+    # real git ground truth (get_diff) and is still available.
+    #
+    # The original check was negative (the buggy substring is GONE) --
+    # translated to the diff, that has to check BOTH sides, not just
+    # "the string doesn't appear anywhere": the '/ effort' division must
+    # appear as a REMOVED ('-') line (proving the bug was actually
+    # targeted, not e.g. left untouched while something unrelated
+    # changed) AND must NOT appear on any ADDED ('+') line (proving the
+    # fix doesn't just reintroduce the same division elsewhere). A bare
+    # "'/ effort' not in result.diff" would pass for the wrong reason if
+    # the diff, say, showed the fix being reverted instead of applied --
+    # this can't.
+    minus_lines = [
+        line for line in result.diff.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    ]
+    plus_lines = [
+        line for line in result.diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    assert any("/ effort" in line for line in minus_lines), (
+        f"expected the buggy '/ effort' division to appear as a REMOVED line:\n{result.diff}"
+    )
+    assert not any("/ effort" in line for line in plus_lines), (
+        f"fix must not reintroduce '/ effort' on an ADDED line:\n{result.diff}"
+    )
 
     # Soft check, not a hard assertion: proving search_code was used is
     # the live-demo requirement (Verification & Commit), not something

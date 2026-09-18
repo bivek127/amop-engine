@@ -416,6 +416,28 @@ async def _watch(
     await init_db(engine)
     provider = OllamaProvider(model=model)
 
+    # Milestone 31 / spec 9.7.1: `amop watch` is the one genuinely
+    # long-running process this project has -- the closest real analog
+    # to "orchestrator startup" -- so it's where the automatic half of
+    # orphan-container reaping lives. A real reap, not a dry-run report:
+    # this process is meant to run unattended, and the candidates
+    # themselves are already conservative (terminal task, unknown task,
+    # or a non-terminal task's container far older than any real run
+    # could still legitimately be). Wrapped defensively -- a Docker
+    # hiccup here must not prevent watch from ever starting to poll
+    # (same reasoning Milestone 28 learned the hard way for the
+    # evaluation runner's own verify step).
+    try:
+        from amop.orchestrator.cleanup import find_orphan_containers, reap_containers
+
+        async with session_factory() as cleanup_session:
+            candidates = await find_orphan_containers(cleanup_session)
+        if candidates:
+            removed = reap_containers(candidates)
+            click.echo(f"Reaped {removed} orphaned sandbox container(s) on startup.")
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  [startup container reap skipped: {exc}]")
+
     single_repo = repo is not None
     if single_repo:
         click.echo(
@@ -1330,6 +1352,171 @@ async def _evaluate(
         Path(output).write_text(rendered + "\n")
         click.echo(f"\nSaved to {output}")
 
+    await engine.dispose()
+
+
+@app.group()
+def index() -> None:
+    """Codebase index maintenance (Section 7.1)."""
+
+
+@index.command("prune-stale")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Actually delete the stale rows. Without this, only reports what would be removed.",
+)
+def index_prune_stale(confirm: bool) -> None:
+    """Delete code_chunks rows under a repo_path that's neither a
+    currently-registered repo nor a real directory on disk anymore
+    (Milestone 20's own logged debt: rows surviving under a dead path
+    from before the amop-engine rename)."""
+    asyncio.run(_index_prune_stale(confirm))
+
+
+async def _index_prune_stale(confirm: bool) -> None:
+    from amop.codebase_intel.indexer import find_stale_code_chunk_paths, prune_stale_code_chunks
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        stale = await find_stale_code_chunk_paths(session)
+        if not stale:
+            click.echo("No stale code_chunks rows found.")
+            await engine.dispose()
+            return
+
+        click.echo(f"{'Deleting' if confirm else 'Would delete'} chunks for {len(stale)} stale repo_path(s):")
+        total_rows = 0
+        for repo_path, count in stale:
+            click.echo(f"  {count:>6}  {repo_path}")
+            total_rows += count
+        click.echo(f"  {'--------':>6}")
+        click.echo(f"  {total_rows:>6}  total")
+
+        if not confirm:
+            click.echo("\nDry run only -- pass --confirm to actually delete these rows.")
+            await engine.dispose()
+            return
+
+        deleted = await prune_stale_code_chunks(session, [p for p, _ in stale])
+        click.echo(f"\nDeleted {deleted} rows.")
+
+    await engine.dispose()
+
+
+@app.group()
+def cleanup() -> None:
+    """Orphan resource reaping (Section 9.7.1): sandbox containers left
+    running by an abnormally-ended chain, and their host-side scratch
+    directories."""
+
+
+@cleanup.command("containers")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Actually remove the containers. Without this, only reports what would be reaped.",
+)
+def cleanup_containers(confirm: bool) -> None:
+    """Reap Docker containers whose task has ended (terminal or
+    unknown/missing) or has been non-terminal far longer than any real
+    task could take. A genuinely active, fresh non-terminal task's
+    container is never touched."""
+    asyncio.run(_cleanup_containers(confirm))
+
+
+async def _cleanup_containers(confirm: bool) -> None:
+    from amop.orchestrator.cleanup import find_orphan_containers, reap_containers
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        candidates = await find_orphan_containers(session)
+
+    if not candidates:
+        click.echo("No orphan containers found.")
+        await engine.dispose()
+        return
+
+    click.echo(f"{'Reaping' if confirm else 'Would reap'} {len(candidates)} container(s):")
+    for c in candidates:
+        click.echo(
+            f"  {c.container_name:<24} task={c.task_id}  reason={c.reason}  "
+            f"age={c.age_seconds / 60:.1f}min"
+        )
+
+    if not confirm:
+        click.echo("\nDry run only -- pass --confirm to actually remove these containers.")
+        await engine.dispose()
+        return
+
+    removed = reap_containers(candidates)
+    click.echo(f"\nRemoved {removed} container(s).")
+    await engine.dispose()
+
+
+@cleanup.command("scratch-dirs")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Actually delete the directories. Without this, only reports what would be removed.",
+)
+def cleanup_scratch_dirs(confirm: bool) -> None:
+    """One-time sweep of amop_workspace/ for directories whose task has
+    ended (terminal or unknown/missing). A non-terminal task's directory
+    is NEVER removed by this sweep, regardless of age -- it's exactly
+    the state a future `amop resume` depends on. Directories not named
+    after a real task_id (hand-named investigation checkpoints from
+    early milestones) are reported separately and never auto-swept."""
+    asyncio.run(_cleanup_scratch_dirs(confirm))
+
+
+async def _cleanup_scratch_dirs(confirm: bool) -> None:
+    from amop.orchestrator.cleanup import (
+        find_stale_scratch_dirs,
+        non_task_scratch_dirs,
+        reap_scratch_dirs,
+    )
+
+    engine = make_engine()
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
+    async with session_factory() as session:
+        candidates = await find_stale_scratch_dirs(session)
+
+    if candidates:
+        click.echo(f"{'Deleting' if confirm else 'Would delete'} {len(candidates)} scratch dir(s):")
+        total_size = 0
+        for c in candidates:
+            click.echo(f"  {c.path}  reason={c.reason}  {c.size_bytes / 1024:.0f}KB")
+            total_size += c.size_bytes
+        click.echo(f"  total: {total_size / 1024 / 1024:.1f}MB")
+    else:
+        click.echo("No stale scratch directories found.")
+
+    others = non_task_scratch_dirs()
+    if others:
+        click.echo(
+            f"\n{len(others)} director(ies) not named after a real task_id -- "
+            "never auto-swept, shown for a human to look at:"
+        )
+        for d in others:
+            click.echo(f"  {d}")
+
+    if not candidates:
+        await engine.dispose()
+        return
+
+    if not confirm:
+        click.echo("\nDry run only -- pass --confirm to actually delete these directories.")
+        await engine.dispose()
+        return
+
+    removed = reap_scratch_dirs(candidates)
+    click.echo(f"\nRemoved {removed} director(ies).")
     await engine.dispose()
 
 

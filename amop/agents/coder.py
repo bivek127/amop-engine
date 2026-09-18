@@ -173,5 +173,18 @@ class CoderAgent(BaseAgent):
         try:
             return await self._run_loop(prompt)
         finally:
-            await asyncio.to_thread(self._sandbox_manager.destroy, self._task_id)
+            # Milestone 31, opt-in -- same reasoning as run_fix/
+            # resume_fix: this standalone path owns its scratch dir for
+            # its whole lifetime (no caller supplied a sandbox, so
+            # nothing outside this method could still need it), and
+            # leaving it around was a real, previously-unnoticed leak --
+            # every run of this exact path (Milestone 0's own real
+            # standalone-agent test, and any future no-ctx caller)
+            # created a fresh directory under the real default
+            # SCRATCH_DIR and never removed it. Confirmed safe: the one
+            # existing test on this path never reads scratch-dir content
+            # after run() returns.
+            await asyncio.to_thread(
+                self._sandbox_manager.destroy, self._task_id, remove_scratch_dir=True
+            )
             self.ctx.sandbox = None

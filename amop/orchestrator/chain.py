@@ -1603,7 +1603,17 @@ async def run_fix(
         await _record_incident_memory(session, result, resolved_repo_path, emit)
         return result
     finally:
-        await asyncio.to_thread(manager.destroy, task_id)
+        # Milestone 31, opt-in: nothing in real production use needs this
+        # task's scratch dir to survive run_fix() returning (the diff is
+        # already in `result`/Postgres, a PR is already pushed) -- this
+        # is the real entry point behind the "100+ leftover directories"
+        # debt (amop fix's own heavy real-world use). NOT applied to
+        # run_optimization/run_dependency_update in this same pass --
+        # deliberately scoped out, their own scratch-dir leak is real,
+        # separate, and left for later (see this milestone's own
+        # findings), matching this project's standing rule against
+        # folding unrelated fixes into one milestone.
+        await asyncio.to_thread(manager.destroy, task_id, remove_scratch_dir=True)
 
 
 @gated_by_task_slot
@@ -1717,4 +1727,9 @@ async def resume_fix(
         await _record_incident_memory(session, chain_result, resolved_repo_path, emit)
         return chain_result
     finally:
-        await asyncio.to_thread(manager.destroy, task_id)
+        # Milestone 31, opt-in -- same reasoning as run_fix() above. This
+        # is the real (fresh) sandbox resume_fix() creates for the
+        # actual resumed run, not reconcile()'s own throwaway inspection
+        # sandbox (already correctly left False, a few frames up inside
+        # reconcile() itself).
+        await asyncio.to_thread(manager.destroy, task_id, remove_scratch_dir=True)

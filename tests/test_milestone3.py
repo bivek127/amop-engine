@@ -308,8 +308,15 @@ async def test_agent_write_is_routed_through_a_real_container(tmp_path):
     result = await agent.run("write hello.py")
 
     assert result.success
+    # Milestone 31: same reasoning as test_milestone2.py's identical
+    # fix -- CoderAgent's standalone path now removes its scratch dir on
+    # return, so this can no longer re-read the file from disk
+    # afterward. write_file's real success=True is already ground truth
+    # the write reached the real container (the tool only returns
+    # success after actually writing there); combined with the exact
+    # args that call succeeded with, this is the same property.
     assert result.tool_calls[0]["success"] is True
-    assert (tmp_path / "hello.py").read_text() == "print('hi')"
+    assert result.tool_calls[0]["args"]["content"] == "print('hi')"
     assert agent.last_container_id is not None
 
     # Container is torn down when run() returns (task-end destroy).

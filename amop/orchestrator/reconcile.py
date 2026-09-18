@@ -365,4 +365,12 @@ async def reconcile(
             detail=detail,
         )
     finally:
-        await asyncio.to_thread(manager.destroy, str(task.id))
+        # remove_scratch_dir=False: this sandbox only ever INSPECTS the
+        # task's real scratch dir -- it doesn't own it, and a resumable
+        # outcome's whole point is that a later step (run_chain's
+        # resume) still needs that directory to exist. Milestone 31
+        # taught SandboxManager.destroy() to remove the host scratch dir
+        # by default for its normal callers (run_fix/resume_fix, which
+        # really do own the directory for the sandbox's whole
+        # lifetime); this is the one real exception.
+        await asyncio.to_thread(manager.destroy, str(task.id), remove_scratch_dir=False)

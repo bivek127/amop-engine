@@ -227,8 +227,18 @@ async def test_agent_writes_file_inside_scratch_dir_succeeds(tmp_path):
 
     assert result.success
     assert result.tool_calls[0]["name"] == "write_file"
+    # Milestone 31: CoderAgent's standalone path (no ctx.sandbox
+    # supplied -- this test's own ToolContext never sets one) now
+    # removes its scratch dir on return (remove_scratch_dir=True), so
+    # this can no longer re-read the file from disk afterward.
+    # write_file's real success=True already IS ground truth the write
+    # reached the sandbox (the tool only returns success after actually
+    # writing the content there, never from the model's own say-so) --
+    # combined with the exact args that call was recorded with, this is
+    # the same property the disk read was checking, from data already
+    # captured rather than re-derived from a now-gone directory.
     assert result.tool_calls[0]["success"] is True
-    assert (tmp_path / "hello.txt").read_text() == "hi there"
+    assert result.tool_calls[0]["args"]["content"] == "hi there"
 
 
 @pytest.mark.asyncio

@@ -761,8 +761,19 @@ async def test_real_model_chain_fixes_the_seeded_bug(session, tmp_path):
     # second live-network dependency to an already-slow real-model test.
     assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
     assert result.code_change_report.files_changed == ["calculator.py"]
-    workspace = tmp_path / str(task.id)
-    assert FIXED_LINE in (workspace / "calculator.py").read_text()
+    # Milestone 31: run_fix() now removes its scratch dir on return
+    # (SandboxManager.destroy(..., remove_scratch_dir=True) -- nothing
+    # in real production use needs it to survive), so this can no longer
+    # re-read the file from disk afterward. result.diff is real git
+    # ground truth (get_diff, not the model's self-report) and is still
+    # available -- checked on the '+' line specifically, not the whole
+    # diff blob, so this can't pass for the wrong reason (e.g. a diff
+    # that showed the fix being removed instead of added).
+    plus_lines = [
+        line for line in result.diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    assert any(FIXED_LINE in line for line in plus_lines), result.diff
 
 
 # ---------------------------------------------------------------------
