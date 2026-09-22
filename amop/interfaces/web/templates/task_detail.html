@@ -1,24 +1,213 @@
 {% extends "base.html" %}
 {% block title %}{{ task.task_type }} {{ task.id|string|truncate(8, True, '') }} — AMOP{% endblock %}
+{% block head %}
+<style>
+  .detail-header {
+    display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin-bottom: .3rem;
+  }
+  .detail-header h1 { margin: 0; text-transform: capitalize; }
+  .live-pill {
+    display: inline-flex; align-items: center; gap: .4rem;
+    font-size: .74rem; font-weight: 700; color: var(--accent);
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .live-pill .pulse {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 var(--accent-dim); }
+    50% { opacity: .5; box-shadow: 0 0 0 4px transparent; }
+  }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 1.5rem; color: var(--text-muted);
+    font-size: .85rem; margin: .5rem 0 2rem;
+  }
+  .meta-row .mono { color: var(--text); }
+  .meta-row strong { color: var(--text-faint); font-weight: 700; margin-right: .35rem; }
+
+  .callout {
+    border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.1rem;
+    margin-bottom: 1.5rem; font-size: .88rem;
+  }
+  .callout.error-callout { border-color: var(--red-dim); background: var(--red-dim); color: var(--red); }
+  .callout h3 { margin: 0 0 .5rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+  .callout p { margin: 0; line-height: 1.55; }
+  .callout .files { margin-top: .6rem; display: flex; flex-wrap: wrap; gap: .4rem; }
+  .callout .files span {
+    font-family: var(--font-mono); font-size: .76rem; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 5px; padding: .15rem .4rem;
+  }
+
+  section.block { margin-bottom: 2rem; }
+  section.block h2 {
+    font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--text-faint); margin: 0 0 .9rem;
+  }
+
+  .pipeline { display: flex; flex-direction: column; }
+  .pipeline-step { display: grid; grid-template-columns: 20px 1fr auto; gap: .75rem; }
+  .pipeline-step .rail {
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .pipeline-step .rail .node {
+    width: 9px; height: 9px; border-radius: 50%; margin-top: .35rem; flex: none;
+  }
+  .pipeline-step .rail .line { width: 1px; flex: 1; background: var(--border); min-height: 1.1rem; }
+  .pipeline-step:last-child .rail .line { display: none; }
+  .pipeline-step .step-body { padding-bottom: 1.1rem; }
+  .pipeline-step .step-title { font-weight: 700; font-size: .88rem; }
+  .pipeline-step .step-sub { color: var(--text-muted); font-size: .8rem; margin-top: .15rem; }
+  .pipeline-step .step-time { color: var(--text-faint); font-size: .78rem; white-space: nowrap; }
+
+  .activity-log { display: flex; flex-direction: column; gap: .55rem; }
+  .activity-log .line {
+    font-family: var(--font-mono); font-size: .8rem; color: var(--text-muted);
+    padding: .5rem .7rem; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 7px; white-space: pre-wrap; word-break: break-word;
+  }
+
+  .pr-card {
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: .85rem 1.1rem;
+  }
+  .pr-card a { color: var(--accent); font-weight: 700; }
+
+  .diff-viewer {
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    font-family: var(--font-mono); font-size: .8rem;
+  }
+  .diff-line { padding: .1rem .9rem; white-space: pre-wrap; word-break: break-word; }
+  .diff-line.meta { color: var(--text-faint); background: var(--surface); }
+  .diff-line.hunk { color: var(--blue); background: var(--blue-dim); }
+  .diff-line.add { color: var(--green); background: var(--green-dim); }
+  .diff-line.del { color: var(--red); background: var(--red-dim); }
+  .diff-line.ctx { color: var(--text-muted); background: var(--surface); }
+</style>
+{% endblock %}
 {% block content %}
 <p><a href="/web/tasks">&larr; back to tasks</a></p>
-<h1>{{ task.task_type }}</h1>
-<table class="meta-table">
-  <tr><td>ID</td><td>{{ task.id }}</td></tr>
-  <tr><td>State</td><td>{{ task.state }}</td></tr>
-  <tr><td>Severity</td><td>{{ task.severity or "—" }}</td></tr>
-  <tr><td>Repo</td><td>{{ repo or "—" }}</td></tr>
-  <tr><td>Created</td><td>{{ task.created_at }}</td></tr>
-  <tr><td>Updated</td><td>{{ task.updated_at or "—" }}</td></tr>
-</table>
+<div class="detail-header">
+  <h1>{{ task.task_type.replace('_', ' ') }}</h1>
+  <span id="state-badge" class="badge {{ task.state | state_color }}"><span class="dot"></span>{{ task.state.replace('_', ' ') }}</span>
+  {% if is_live %}
+    <span class="live-pill" id="live-pill"><span class="pulse"></span>Watching for updates</span>
+  {% endif %}
+</div>
+<div class="meta-row">
+  <span><strong>ID</strong><span class="mono">{{ task.id }}</span></span>
+  <span><strong>Repo</strong><span class="mono">{{ repo or "—" }}</span></span>
+  <span><strong>Created</strong>{{ task.created_at | relative_time }}</span>
+  <span><strong>Updated</strong>{{ (task.updated_at or task.created_at) | relative_time }}</span>
+</div>
+
 {% if prompt %}
+<section class="block">
   <h2>Description</h2>
   <p>{{ prompt }}</p>
+</section>
 {% endif %}
-<h2>Diff</h2>
-{% if diff %}
-  <pre>{{ diff }}</pre>
-{% else %}
-  <p>No diff recorded for this task.</p>
+
+{% if error %}
+<div class="callout error-callout">
+  <h3>Error</h3>
+  <p>{{ error }}</p>
+</div>
+{% endif %}
+
+{% if root_cause_report %}
+<div class="callout">
+  <h3>Root cause (confidence {{ "%.0f"|format(root_cause_report.confidence * 100) }}%)</h3>
+  <p>{{ root_cause_report.root_cause }}</p>
+  {% if root_cause_report.affected_files %}
+    <div class="files">
+      {% for f in root_cause_report.affected_files %}<span class="mono">{{ f }}</span>{% endfor %}
+    </div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if pull_request %}
+<section class="block">
+  <h2>Pull request</h2>
+  <div class="pr-card">
+    <div>
+      <a href="{{ pull_request.url }}" target="_blank" rel="noopener">{{ pull_request.url }}</a>
+      {% if pull_request.number %}<span class="mono" style="color:var(--text-faint)"> #{{ pull_request.number }}</span>{% endif %}
+    </div>
+    <span class="badge {{ 'green' if pull_request.status in ('open', 'merged') else 'gray' }}">
+      <span class="dot"></span>{{ pull_request.status }}
+    </span>
+  </div>
+</section>
+{% endif %}
+
+<section class="block">
+  <h2>Pipeline</h2>
+  {% if transitions %}
+    <div class="pipeline">
+      {% for t in transitions %}
+        <div class="pipeline-step">
+          <div class="rail">
+            <span class="node" style="background: var(--{{ t.to_state | state_color }})"></span>
+            <span class="line"></span>
+          </div>
+          <div class="step-body">
+            <div class="step-title">{{ t.to_state.replace('_', ' ') }}</div>
+            <div class="step-sub">{{ t.trigger or "—" }} &middot; {{ t.actor or "system" }}</div>
+          </div>
+          <div class="step-time mono">{{ t.timestamp | relative_time }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="empty-state">Not picked up yet.</p>
+  {% endif %}
+</section>
+
+{% if stages %}
+<section class="block">
+  <h2>Activity log</h2>
+  <div class="activity-log">
+    {% for s in stages %}<div class="line">{{ s }}</div>{% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section class="block">
+  <h2>Diff</h2>
+  {% if diff_lines %}
+    <div class="diff-viewer">
+      {% for line in diff_lines %}<div class="diff-line {{ line.kind }}">{{ line.text }}</div>{% endfor %}
+    </div>
+  {% else %}
+    <p class="empty-state">No diff recorded for this task yet.</p>
+  {% endif %}
+</section>
+
+{% if is_live %}
+<script>
+  (function () {
+    const taskId = "{{ task.id }}";
+    const initialState = "{{ task.state }}";
+    const poll = async () => {
+      try {
+        const res = await fetch(`/tasks/${taskId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.state !== initialState) {
+          location.reload();
+          return;
+        }
+      } catch (e) {
+        // Transient fetch failure -- try again on the next tick rather
+        // than giving up the live view over one dropped request.
+      }
+      setTimeout(poll, 3000);
+    };
+    setTimeout(poll, 3000);
+  })();
+</script>
 {% endif %}
 {% endblock %}

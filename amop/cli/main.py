@@ -14,7 +14,7 @@ from amop.database.models import MemoryItem
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
-from amop.orchestrator.chain import resume_fix, run_fix
+from amop.orchestrator.chain import persist_chain_result, resume_fix, run_fix
 from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
 from amop.orchestrator.optimize import MIN_IMPROVEMENT_PCT, run_optimization
 from amop.orchestrator.reporting import run_report
@@ -180,16 +180,7 @@ async def _fix(repo: str, description: str, model: str, mode: str) -> None:
         # moment this function returned. Same shape now written by
         # `_optimize`/`_update_deps` below, so the API can read a
         # consistent set of task_context keys regardless of task_type.
-        task.task_context = {
-            **(task.task_context or {}),
-            "final_state": result.final_state.value,
-            "error": result.error,
-            "stages": result.stages,
-            "tool_calls": result.tool_calls,
-            "diff": result.diff,
-        }
-        session.add(task)
-        await session.commit()
+        await persist_chain_result(session, task, result)
 
     click.echo()
     if result.root_cause_report:
@@ -306,16 +297,7 @@ async def _resume(task_id: str, model: str, mode: str) -> None:
             emit=lambda message: click.echo(f"  {message}"),
         )
 
-        task.task_context = {
-            **(task.task_context or {}),
-            "final_state": result.final_state.value,
-            "error": result.error,
-            "stages": result.stages,
-            "tool_calls": result.tool_calls,
-            "diff": result.diff,
-        }
-        session.add(task)
-        await session.commit()
+        await persist_chain_result(session, task, result)
 
     click.echo()
     if result.error:

@@ -14,14 +14,16 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from amop.api.deps import get_session
-from amop.database.models import Task
+from amop.api.routes.tasks import create_task_endpoint
+from amop.api.schemas import TaskCreate
+from amop.database.models import PullRequest, Repository, Task
 from amop.interfaces.web.auth import (
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
@@ -29,7 +31,8 @@ from amop.interfaces.web.auth import (
     require_web_session,
     token_is_valid,
 )
-from amop.orchestrator.state_machine import TaskState
+from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
+from amop.orchestrator.task import get_transitions
 
 router = APIRouter(prefix="/web", tags=["web"])
 
@@ -170,6 +173,22 @@ async def task_detail(
     # one source of "what counts as this task's diff", not a second one
     # invented for the dashboard.
     diff = ctx.get("diff") or ""
+
+    # Milestone 18 (Resumed) #3/#4: the real journey, from real ground
+    # truth, not a fabricated pipeline -- task_transitions is Milestone
+    # 22's hash-chained audit trail (the actual state-machine skeleton),
+    # `stages` is chain.py's own narration of what happened inside each
+    # state (root cause, test results, review verdict, PR link -- see
+    # chain.py's `stage(...)` calls), and `pull_requests` is the real
+    # table a PR is ever actually written to (never a task_context field
+    # that could drift from what GitHub says).
+    transitions = await get_transitions(session, task_id)
+    pr_row = (
+        await session.execute(
+            select(PullRequest).where(PullRequest.task_id == task_id)
+        )
+    ).scalar_one_or_none()
+
     return templates.TemplateResponse(
         request,
         "task_detail.html",
@@ -178,6 +197,77 @@ async def task_detail(
             "prompt": ctx.get("prompt"),
             "repo": ctx.get("repo"),
             "diff": diff,
+            "diff_lines": _diff_lines(diff),
+            "transitions": transitions,
+            "stages": ctx.get("stages") or [],
+            "root_cause_report": ctx.get("root_cause_report"),
+            "error": ctx.get("error") or ctx.get("background_execution_error"),
+            "pull_request": pr_row,
+            "is_live": TaskState(task.state) not in TERMINAL_STATES,
             "show_logout": True,
         },
     )
+
+
+def _diff_lines(diff: str) -> list[dict]:
+    """A unified diff, split for real +/- line coloring in the template --
+    no client-side library, this project has no JS build step to hang one
+    off (same "no external deps for something a 20-line loop covers"
+    posture as tasks.html's own vanilla-JS search filter)."""
+    lines = []
+    for raw in diff.splitlines():
+        if raw.startswith("+++") or raw.startswith("---"):
+            kind = "meta"
+        elif raw.startswith("@@"):
+            kind = "hunk"
+        elif raw.startswith("+"):
+            kind = "add"
+        elif raw.startswith("-"):
+            kind = "del"
+        else:
+            kind = "ctx"
+        lines.append({"kind": kind, "text": raw})
+    return lines
+
+
+@router.get(
+    "/submit", response_class=HTMLResponse, dependencies=[Depends(require_web_session)]
+)
+async def submit_form(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> HTMLResponse:
+    repos = list(
+        (await session.execute(select(Repository).order_by(Repository.repo_path))).scalars()
+    )
+    return templates.TemplateResponse(
+        request, "submit.html", {"repos": repos, "show_logout": True}
+    )
+
+
+@router.post("/submit", dependencies=[Depends(require_web_session)])
+async def submit_bug(
+    repo: str = Form(...),
+    description: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    """Reuses `create_task_endpoint` directly rather than re-implementing
+    its repo_id resolution / background-execution scheduling -- Section
+    3.2's "no interface has a privileged bypass path" principle, applied
+    the same way `_fix`'s own consistency test already proves it for the
+    CLI (test_a_task_created_via_the_cli_path_is_visible_through_the_api).
+    Calling the route function directly (not over HTTP) is safe here:
+    `Depends(...)` defaults are only resolved by FastAPI when a request
+    is routed through it, not when called as a plain function with real
+    arguments -- and `background_tasks` is handed to the redirect
+    response the same way FastAPI would have, so the background job runs
+    exactly as it would via the JSON API.
+    """
+    background_tasks = BackgroundTasks()
+    task = await create_task_endpoint(
+        TaskCreate(task_type="bug_fix", repo=repo, description=description),
+        background_tasks,
+        session,
+    )
+    response = RedirectResponse(url=f"/web/tasks/{task.id}", status_code=303)
+    response.background = background_tasks
+    return response

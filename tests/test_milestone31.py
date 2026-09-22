@@ -103,8 +103,7 @@ async def test_stale_path_not_registered_and_not_on_disk_is_flagged(session, tmp
     stale = await find_stale_code_chunk_paths(session)
 
     assert any(p == dead_path for p, _ in stale)
-
-
+    
 async def test_real_unregistered_path_that_still_exists_is_not_flagged(session, tmp_path):
     """The real nuance found against the actual dev database: a
     legitimate ad-hoc fixture path (never registered via `amop repos

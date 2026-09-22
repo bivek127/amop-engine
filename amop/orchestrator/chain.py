@@ -26,6 +26,7 @@ consequences.
 """
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 import uuid
 from collections.abc import Callable, Sequence
@@ -64,7 +65,7 @@ from amop.orchestrator.concurrency import (
     try_repo_file_lock,
 )
 from amop.orchestrator.reconcile import reconcile
-from amop.orchestrator.task import transition_with_retry
+from amop.orchestrator.task import get_task, transition, transition_with_retry
 from amop.safety import scope_guard
 from amop.safety.engine import resolve_within_scratch
 from amop.safety.permissions import load_permission_overrides, normalize_repo_identity
@@ -74,6 +75,8 @@ from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the s
 from amop.sandbox.manager import SandboxManager
 from amop.tools import github as github_tools  # noqa: F401 -- registers create_pull_request/get_ci_status
 from amop.tools.registry import ToolContext, ToolResult, get_tool, invoke_tool
+
+logger = logging.getLogger("amop.orchestrator.chain")
 
 # Section 4.2's counters: "test failure AND retry_count < max_fix_iterations
 # (default 4)" and "Reviewer rejects with actionable feedback AND
@@ -426,6 +429,25 @@ class ChainResult:
     # explicitly asks to be shown (found while writing that check, not
     # anticipated up front).
     tool_calls: list[dict] = field(default_factory=list)
+
+
+async def persist_chain_result(session: AsyncSession, task: Task, result: ChainResult) -> None:
+    """The final_state/error/stages/tool_calls/diff merge every real
+    run_fix() caller performs once the chain returns -- e.g. GET
+    /tasks/{id}/diff reads task_context['diff'], which only exists once
+    a caller writes it here. Pulled out once a second caller
+    (run_fix_and_persist, below) needed the exact same shape the CLI's
+    `_fix()` already had, so the two can't silently drift apart."""
+    task.task_context = {
+        **(task.task_context or {}),
+        "final_state": result.final_state.value,
+        "error": result.error,
+        "stages": result.stages,
+        "tool_calls": result.tool_calls,
+        "diff": result.diff,
+    }
+    session.add(task)
+    await session.commit()
 
 
 def _noop(_message: str) -> None:
@@ -1614,6 +1636,76 @@ async def run_fix(
         # findings), matching this project's standing rule against
         # folding unrelated fixes into one milestone.
         await asyncio.to_thread(manager.destroy, task_id, remove_scratch_dir=True)
+
+
+async def run_fix_and_persist(
+    session_factory,
+    task_id: uuid.UUID,
+    *,
+    description: str,
+    repo_path: Path,
+    model,
+    mode: str = "operator",
+) -> None:
+    """Milestone 18 (Resumed) / Step 0: the entry point for callers that
+    can't hold a request-scoped session across a multi-minute chain run
+    and have no terminal to stream progress to -- concretely, `POST
+    /tasks`'s FastAPI `BackgroundTasks` hand-off. Opens its own session
+    from `session_factory` (same pattern as the webhook background job in
+    api/routes/webhooks.py), runs run_fix() to completion, and persists
+    the result exactly like every other caller.
+
+    run_chain() already lands its own internal failures on a real
+    terminal/NEEDS_HUMAN_INPUT state -- this only has to cover what's
+    OUTSIDE that: run_fix()'s own pre-chain setup (materialize,
+    detect_stack, sandbox creation) has no such handling, so a bad repo
+    path or an exhausted concurrency slot would otherwise leave the task
+    stuck at CREATED forever with nothing to explain why. On any such
+    failure, land the task on the best legal state _failure_state's own
+    preference table gives for wherever it actually got to, same
+    reasoning run_chain() uses for its internal failures -- never assume
+    CREATED, since run_chain() may have already moved it further before
+    something later broke.
+    """
+    try:
+        async with session_factory() as session:
+            task = await get_task(session, task_id)
+            if task is None:
+                logger.warning("run_fix_and_persist: task %s no longer exists", task_id)
+                return
+            result = await run_fix(
+                session,
+                task,
+                description=description,
+                repo_path=repo_path,
+                model=model,
+                mode=mode,
+                emit=lambda message: logger.info("task %s: %s", task_id, message),
+            )
+            await persist_chain_result(session, task, result)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: this must never escape
+        logger.exception(
+            "run_fix_and_persist: task %s failed outside run_chain's own handling", task_id
+        )
+        try:
+            async with session_factory() as session:
+                task = await get_task(session, task_id)
+                if task is not None and TaskState(task.state) not in TERMINAL_STATES:
+                    task.task_context = {
+                        **(task.task_context or {}),
+                        "background_execution_error": str(exc),
+                    }
+                    await transition(
+                        session,
+                        task,
+                        _failure_state(TaskState(task.state)),
+                        trigger=f"background execution failed: {exc}",
+                        actor="system:background_task",
+                    )
+        except Exception:
+            logger.exception(
+                "run_fix_and_persist: also failed to record the failure for task %s", task_id
+            )
 
 
 @gated_by_task_slot

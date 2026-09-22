@@ -3,16 +3,19 @@ every other interface's core loop is "look at tasks, act on tasks."
 """
 
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from amop.api.auth import require_operator_token
-from amop.api.deps import get_session
+from amop.api.deps import get_session, get_session_factory
 from amop.api.errors import api_error
 from amop.api.schemas import DiffOut, TaskCreate, TaskOut, TaskTransitionOut
 from amop.database.models import Repository, Task
+from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
+from amop.orchestrator.chain import run_fix_and_persist
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import (
     ConcurrentUpdateError,
@@ -61,14 +64,20 @@ async def _transition_or_409(
     dependencies=[Depends(require_operator_token)],
 )
 async def create_task_endpoint(
-    body: TaskCreate, session: AsyncSession = Depends(get_session)
+    body: TaskCreate,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
 ) -> Task:
-    """Creates the row only -- does not execute the chain. See the
-    Milestone 15 plan's own decision on this: there is no async
-    worker/queue in this codebase (spec's architecture diagram assumes a
-    Redis-backed one that was never built), and this endpoint's own spec
-    description is "create a task manually", not "create and run".
-    Running one still goes through `amop fix`/`update-deps`/`optimize`.
+    """Creates the row -- and, for a `bug_fix` with a real repo and
+    description, also kicks off `run_fix()` in the background (Milestone
+    18 Resumed / Step 0). Milestone 15's original "create the row only"
+    contract still holds for every other case: no repo/description means
+    there is nothing to run yet (Section 15.2's "create a task manually"
+    shape, e.g. for a task a human will populate/dispatch some other
+    way), and `optimization`/`dependency_update` tasks are unaffected --
+    those still only ever run via `amop optimize`/`amop update-deps`, per
+    this milestone's own explicit scope (the dashboard's submit form is a
+    bug-report form, not a generic task-type dispatcher).
     """
     repo_path = body.repo
     if body.repo_id is not None:
@@ -79,7 +88,18 @@ async def create_task_endpoint(
             )
         repo_path = repo_row.repo_path
     task_context = {"repo": repo_path, "prompt": body.description}
-    return await create_task(session, task_type=body.task_type, task_context=task_context)
+    task = await create_task(session, task_type=body.task_type, task_context=task_context)
+
+    if body.task_type == "bug_fix" and repo_path and body.description:
+        background_tasks.add_task(
+            run_fix_and_persist,
+            get_session_factory(),
+            task.id,
+            description=body.description,
+            repo_path=Path(repo_path),
+            model=OllamaProvider(model=DEFAULT_MODEL),
+        )
+    return task
 
 
 @router.get("/{task_id}", response_model=TaskOut)

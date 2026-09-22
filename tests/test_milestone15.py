@@ -18,7 +18,7 @@ import pytest_asyncio
 from sqlalchemy import select, text
 
 from amop.api.app import app
-from amop.api.deps import get_session
+from amop.api.deps import configure_session_factory, get_session
 from amop.database.models import MemoryItem, PullRequest, Repository, Task
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.orchestrator.state_machine import TaskState
@@ -73,6 +73,13 @@ async def client(engine):
     class of pitfall Milestone 1's own `engine` fixture docstring
     already warns about, here via a different mechanism. Staying on
     httpx.AsyncClient keeps everything in one loop.
+
+    ALSO configures deps.py's module-level session factory (via
+    `configure_session_factory`), not just the request-scoped
+    `get_session` override: Milestone 18 (Resumed)'s `POST /tasks`
+    background execution reads that module-level factory directly (see
+    test_milestone21.py's `client` fixture docstring, which established
+    this same pattern first for the webhook's own background job).
     """
     session_factory = make_session_factory(engine)
 
@@ -81,6 +88,7 @@ async def client(engine):
             yield s
 
     app.dependency_overrides[get_session] = _override_get_session
+    configure_session_factory(session_factory)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
