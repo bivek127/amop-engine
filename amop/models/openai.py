@@ -97,10 +97,20 @@ class OpenAIProvider(BaseLLM):
         model: str = DEFAULT_MODEL,
         api_key: str | None = None,
         timeout: float = 120.0,
+        max_tokens: int = 4096,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.timeout = timeout
+        # Not sent in the request payload below -- this provider has
+        # never been exercised against a real API (see this module's
+        # docstring) and adding a live behavior change here is out of
+        # scope for Milestone 32. Exists only as the worst-case output
+        # bound models/cost.py's check_budget_before_dispatch reads
+        # before dispatch (D-18); Claude's equivalent attribute IS sent,
+        # because that provider already sends max_tokens for other
+        # reasons.
+        self.max_tokens = max_tokens
 
     async def complete(
         self,
@@ -132,11 +142,22 @@ class OpenAIProvider(BaseLLM):
         # on models or accounts without prompt caching, hence the .get
         # chain rather than an assumed key (D-16 still applies: it must
         # be surfaced distinctly, not folded into prompt_tokens).
+        prompt_tokens = usage.get("prompt_tokens")
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        # Milestone 32 fix: unlike Anthropic's usage.input_tokens (which
+        # already EXCLUDES cached tokens), OpenAI's prompt_tokens is the
+        # TOTAL including whatever prompt_tokens_details.cached_tokens
+        # reports -- cached_tokens is a subset of prompt_tokens, not
+        # additional to it. Setting uncached_input_tokens=prompt_tokens
+        # directly (the pre-Milestone-32 code) double-counted every
+        # cached token once at the base rate here and again at the cache
+        # rate below, which would have overpriced every OpenAI call with
+        # a warm cache. Subtracting recovers the true uncached count.
+        uncached = prompt_tokens - cached if prompt_tokens is not None and cached else prompt_tokens
 
         return ModelResponse(
             content=_content_from_message(message),
-            input_tokens=usage.get("prompt_tokens"),
+            uncached_input_tokens=uncached,
             output_tokens=usage.get("completion_tokens"),
             cache_read_input_tokens=cached,
             model=data.get("model") or self.model,

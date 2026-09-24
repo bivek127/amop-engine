@@ -134,11 +134,14 @@ async def record_model_call(
     *,
     agent_name: str,
     model: str,
-    input_tokens: int | None,
+    uncached_input_tokens: int | None,
     output_tokens: int | None,
+    cache_creation_input_tokens: int | None = None,
+    cache_read_input_tokens: int | None = None,
     latency_ms: int | None = None,
 ) -> None:
-    """Write one chained `agent_actions` row for a model completion.
+    """Write one chained `agent_actions` row for a model completion, with
+    its real cost (spec 11.3/11.3.1, Milestone 32).
 
     Spec 11.3 puts these in the same table as tool calls, which is what
     lets Section 20's cost-per-task metric aggregate them alongside
@@ -151,9 +154,23 @@ async def record_model_call(
     a fake "ALLOW" would put rows in the audit trail claiming a
     permission check that never ran.
 
+    `estimated_cost_usd` is computed here (not by the caller) from the
+    real per-call token counts, and the atomic `budgets` accumulation
+    (11.3.2/D-18) happens in this SAME transaction, before commit --
+    "inside the same transaction as the agent_actions write, not
+    read-modify-write" is the literal requirement, and the only way to
+    satisfy it is doing both in the one `audit_session` this function
+    already opens for durability. Accumulates into BOTH the "global"
+    scope (what check_budget_before_dispatch enforces) and this task's
+    own "task:<uuid>" scope (recorded for a future per-task breaker,
+    not itself enforced yet -- see models/cost.py's module docstring).
+
     Never raises, for the same reason record_action never does: losing
     an audit row must not take down the run that produced it. The
-    failure is logged loudly instead.
+    failure is logged loudly instead -- which now also means a lost
+    audit row is a lost cost-accounting update; reconcile_budget's
+    periodic recompute from agent_actions is what keeps that from
+    silently drifting forever (see models/cost.py).
     """
     session = getattr(ctx, "db_session", None)
     if session is None:
@@ -162,13 +179,23 @@ async def record_model_call(
     try:
         from sqlalchemy.ext.asyncio import async_sessionmaker
 
+        from amop.models.cost import GLOBAL_SCOPE, estimate_cost_usd, record_spend, task_scope
         from amop.orchestrator.concurrency import engine_for
+
+        task_id = getattr(ctx, "task_id", None)
+        cost = estimate_cost_usd(
+            model,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+            output_tokens=output_tokens,
+        )
 
         engine = engine_for(session)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as audit_session:
             row = AgentAction(
-                task_id=getattr(ctx, "task_id", None),
+                task_id=task_id,
                 agent_name=agent_name,
                 tool_name=MODEL_CALL_TOOL_NAME,
                 # The model that answered -- which, with Milestone 27's
@@ -180,15 +207,25 @@ async def record_model_call(
                 decision=None,
                 decision_reason=None,
                 latency_ms=latency_ms,
-                input_tokens=input_tokens,
+                input_tokens=uncached_input_tokens,
                 output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                estimated_cost_usd=cost,
                 timestamp=datetime.now(UTC),
             )
             await append_chained(audit_session, row)
+            await record_spend(audit_session, scope=GLOBAL_SCOPE, amount_usd=cost)
+            if task_id is not None:
+                await record_spend(
+                    audit_session, scope=task_scope(task_id), amount_usd=cost
+                )
             await audit_session.commit()
     except Exception:  # noqa: BLE001 -- see module docstring
         logger.exception(
             "audit: failed to record a model call for %s -- the completion "
-            "itself is unaffected, but its token usage has NO audit row",
+            "itself is unaffected, but its token usage and cost have NO "
+            "audit row this time (reconcile_budget's periodic recompute "
+            "will catch up once a later call succeeds)",
             agent_name,
         )

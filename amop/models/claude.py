@@ -165,7 +165,10 @@ class ClaudeProvider(BaseLLM):
             # D-16: these three are kept distinct rather than summed --
             # see ModelResponse's docstring for why collapsing them
             # misprices a run badly enough to trip a cost breaker.
-            input_tokens=usage.get("input_tokens"),
+            # Anthropic's own usage.input_tokens already excludes cached
+            # tokens (unlike OpenAI's prompt_tokens, see openai.py), so
+            # no subtraction is needed here to get the uncached count.
+            uncached_input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             cache_creation_input_tokens=usage.get("cache_creation_input_tokens"),
             cache_read_input_tokens=usage.get("cache_read_input_tokens"),

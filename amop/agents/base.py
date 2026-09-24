@@ -124,19 +124,36 @@ class BaseAgent(ABC):
 
     async def _complete_and_record(self, messages: list[dict]):
         """One model call, with its token usage written to the audit
-        trail (spec 11.3) instead of thrown away.
+        trail (spec 11.3) instead of thrown away, and now (Milestone 32,
+        spec 11.3.2/D-18) gated by a real pre-dispatch budget check.
 
-        Providers have always captured `input_tokens`/`output_tokens`;
-        until now this loop discarded them, which is why Section 20.1's
-        tokens-per-task metric had nothing to aggregate and
-        `estimated_cost_usd` stayed permanently NULL. Recording happens
-        here, in the one place every agent's completions funnel through,
-        rather than at each of the three call sites below -- a fourth
-        call site added later gets the accounting for free.
+        Providers have always captured `uncached_input_tokens`/
+        `output_tokens`; until Milestone 32 this loop discarded them,
+        which is why Section 20.1's tokens-per-task metric had nothing
+        to aggregate and `estimated_cost_usd` stayed permanently NULL.
+        Recording happens here, in the one place every agent's
+        completions funnel through, rather than at each of the three
+        call sites below -- a fourth call site added later gets the
+        accounting AND the budget check for free.
 
-        The write never raises (see audit/actions.py) and never blocks
+        The budget check runs before dispatch and raises
+        BudgetExceededError to refuse; that propagates up through
+        _run_loop's existing `except Exception` handling around every
+        _complete_and_record call, landing as a normal agent-run failure
+        -- no new failure-handling path needed. The audit write, by
+        contrast, never raises (see audit/actions.py) and never blocks
         the completion: a run must not fail because its bookkeeping did.
         """
+        if self.ctx is not None and getattr(self.ctx, "db_session", None) is not None:
+            from amop.models.cost import check_budget_before_dispatch
+
+            await check_budget_before_dispatch(
+                self.ctx.db_session,
+                model=getattr(self.model, "model", "unknown"),
+                messages=messages,
+                max_tokens=getattr(self.model, "max_tokens", 4096),
+            )
+
         started = time.monotonic()
         response = await self.model.complete(messages)
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -146,8 +163,10 @@ class BaseAgent(ABC):
                 self.ctx,
                 agent_name=self.name,
                 model=response.model,
-                input_tokens=response.input_tokens,
+                uncached_input_tokens=response.uncached_input_tokens,
                 output_tokens=response.output_tokens,
+                cache_creation_input_tokens=response.cache_creation_input_tokens,
+                cache_read_input_tokens=response.cache_read_input_tokens,
                 latency_ms=latency_ms,
             )
         return response

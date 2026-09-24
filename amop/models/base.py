@@ -18,17 +18,27 @@ class ModelResponse(BaseModel):
     D-16 puts the responsibility for surfacing these distinctly on each
     provider implementation rather than on shared cost logic, which is
     why they live here on the shared response shape but are parsed
-    per-provider. Both default to None: providers that don't report
-    caching (Ollama, which is local and free) simply leave them unset,
-    and every pre-existing caller is unaffected.
+    per-provider. All three default to None: providers that don't report
+    caching (Ollama, which is local and free) simply leave the two cache
+    fields unset, and every pre-existing caller is unaffected.
+
+    Milestone 32 (spec 11.3/11.3.1): `uncached_input_tokens` is the field
+    name spec 11.3.1's own cost formula uses, so it's named that here
+    rather than the more generic `input_tokens` this field was
+    originally called -- Anthropic's `usage.input_tokens` already
+    excludes cached tokens by the API's own design, and OpenAI's
+    provider now subtracts `cached_tokens` out of `prompt_tokens` before
+    setting this (models/openai.py), so it means the same "never
+    double-counted with the two cache fields below" thing for every
+    provider, not just Claude's.
     """
 
     content: str
-    input_tokens: int | None = None
+    uncached_input_tokens: int | None = None
     output_tokens: int | None = None
     # Input tokens billed at the cache-WRITE rate (typically a premium
     # over base input) and the cache-READ rate (typically ~10x cheaper).
-    # `input_tokens` stays the uncached count so the three never
+    # `uncached_input_tokens` excludes both, so the three never
     # double-count each other.
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None

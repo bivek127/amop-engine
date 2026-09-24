@@ -1,15 +1,17 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     Numeric,
+    PrimaryKeyConstraint,
     Text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -351,6 +353,16 @@ class AgentAction(Base):
     # make an intact chain verify as BROKEN.
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Section 11.3.1 (Design Decision D-16), Milestone 32: kept distinct
+    # from input_tokens (which stays the UNCACHED count -- see
+    # ModelResponse's docstring in models/base.py) so estimate_cost_usd()
+    # never double-counts a token as both "uncached" and "cached". NULL
+    # on providers/calls that report no caching (Ollama; any Claude/
+    # OpenAI call before a cache warms), same "missing means zero, not
+    # unknown" convention as input_tokens/output_tokens above. Also
+    # excluded from the hashed chain content, same reasoning as those two.
+    cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -421,3 +433,40 @@ class PullRequest(Base):
     )
 
     __table_args__ = (Index("ix_pull_requests_repo_path", "repo_path"),)
+
+
+class Budget(Base):
+    """Spec Section 14.2's v3.0 `budgets` table -- Milestone 32, Section
+    11.3.2 (Design Decision D-18)'s atomic spend accumulator.
+
+    `spent_usd` is a CACHE of `SUM(agent_actions.estimated_cost_usd)`,
+    kept current by two mechanisms: `models/cost.py::record_spend()`'s
+    atomic `UPDATE ... SET spent_usd = spent_usd + ?` inside the same
+    transaction as each real `agent_actions` model-call row, and
+    `reconcile_budget()`'s periodic full recompute from that same sum.
+    Per 11.3.2's own framing: "the running total is correct under
+    concurrency without an explicit lock [via the atomic UPDATE]... the
+    counter is a cache, the table [agent_actions] is the truth."
+
+    `scope` is either the literal string "global" (the daily platform-
+    wide cap `check_budget_before_dispatch` enforces) or `task:<uuid>`
+    (per-task accumulation, written on every call for future use by a
+    per-task breaker -- not itself enforced by this milestone, which
+    scopes its dispatch-time refusal to "global" only; see
+    models/cost.py's module docstring for why `max_cost_per_task_usd`
+    stays a separate, not-yet-built breaker).
+
+    Composite primary key (not a surrogate id): a given scope+day is
+    exactly one row by definition, which is what makes the
+    INSERT ... ON CONFLICT DO UPDATE upsert in record_spend/
+    reconcile_budget atomic and race-free -- there is no read-then-decide
+    "does this row exist yet" step for two concurrent callers to race on.
+    """
+
+    __tablename__ = "budgets"
+
+    scope: Mapped[str] = mapped_column(Text)
+    period_start: Mapped[date] = mapped_column(Date)
+    spent_usd: Mapped[float] = mapped_column(Numeric, nullable=False, default=0)
+
+    __table_args__ = (PrimaryKeyConstraint("scope", "period_start"),)

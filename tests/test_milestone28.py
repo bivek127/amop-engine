@@ -299,7 +299,7 @@ async def test_token_usage_is_recorded_to_agent_actions(session):
         Ctx(),
         agent_name="reviewer",
         model="qwen2.5-coder:14b",
-        input_tokens=1234,
+        uncached_input_tokens=1234,
         output_tokens=56,
         latency_ms=789,
     )
@@ -342,7 +342,7 @@ async def test_model_call_rows_are_separable_from_tool_call_rows(session):
         Ctx(),
         agent_name="coder",
         model="qwen2.5-coder:14b",
-        input_tokens=10,
+        uncached_input_tokens=10,
         output_tokens=5,
     )
 

@@ -10,6 +10,7 @@ and the Web dashboard (Stage 3, mounted as a second router on this same
 app) both call these routes, no exceptions.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -22,6 +23,7 @@ from amop.api.routes import memory, pull_requests, reports, repositories, tasks,
 from amop.database.session import init_db, make_engine, make_session_factory
 from amop.interfaces.web.auth import WebAuthRequired
 from amop.interfaces.web.routes import router as web_router
+from amop.models.cost import hourly_reconcile_loop
 from amop.orchestrator.state_machine import IllegalTransitionError
 
 logger = logging.getLogger("amop.api")
@@ -31,8 +33,21 @@ logger = logging.getLogger("amop.api")
 async def lifespan(app: FastAPI):
     engine = make_engine()
     await init_db(engine)
-    configure_session_factory(make_session_factory(engine))
+    session_factory = make_session_factory(engine)
+    configure_session_factory(session_factory)
+
+    # 11.3.2's "hourly thereafter" reconciliation -- `serve-api` is one
+    # of the two processes in this codebase that actually stays up long
+    # enough for that to mean anything (see hourly_reconcile_loop's own
+    # docstring). Cancelled cleanly on shutdown; a failed reconciliation
+    # tick is logged and retried next interval, never crashes the app.
+    reconcile_task = asyncio.create_task(hourly_reconcile_loop(session_factory))
     yield
+    reconcile_task.cancel()
+    try:
+        await reconcile_task
+    except asyncio.CancelledError:
+        pass
     await engine.dispose()
 
 

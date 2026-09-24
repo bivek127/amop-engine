@@ -65,7 +65,7 @@ class OllamaProvider(BaseLLM):
 
         return ModelResponse(
             content=content,
-            input_tokens=data.get("prompt_eval_count"),
+            uncached_input_tokens=data.get("prompt_eval_count"),
             output_tokens=data.get("eval_count"),
             model=self.model,
         )

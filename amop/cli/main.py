@@ -420,6 +420,15 @@ async def _watch(
     except Exception as exc:  # noqa: BLE001
         click.echo(f"  [startup container reap skipped: {exc}]")
 
+    # Spec 11.3.2's "hourly thereafter" reconciliation -- same "closest
+    # real analog to orchestrator startup" reasoning as the container
+    # reap immediately above applies here too: init_db() already covered
+    # this process's own startup reconciliation, this covers the ongoing
+    # half for as long as `watch` keeps running.
+    from amop.models.cost import hourly_reconcile_loop
+
+    reconcile_task = asyncio.create_task(hourly_reconcile_loop(session_factory))
+
     single_repo = repo is not None
     if single_repo:
         click.echo(
@@ -467,6 +476,11 @@ async def _watch(
     except KeyboardInterrupt:
         click.echo("\nStopped.")
     finally:
+        reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
         await engine.dispose()
 
 

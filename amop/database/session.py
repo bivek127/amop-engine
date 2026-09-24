@@ -55,6 +55,21 @@ async def init_db(engine: AsyncEngine) -> None:
         for statement in _ADDITIVE_COLUMNS:
             await conn.execute(text(statement))
 
+    # Section 11.3.2's startup reconciliation. Every one of AMOP's real
+    # entry points (every CLI command, the FastAPI app's lifespan) calls
+    # init_db() first -- there is no single persistent "orchestrator
+    # process" in this codebase to hang a one-time startup hook off, so
+    # this is the actual, honest place "on orchestrator startup" maps to.
+    # Lazy import: models/cost.py -> database/models.py only, never back
+    # to this module, but importing it at call time (not module load
+    # time) keeps that direction impossible to get backwards by accident
+    # as either file evolves.
+    from amop.models.cost import GLOBAL_SCOPE, reconcile_budget
+
+    session_factory = make_session_factory(engine)
+    async with session_factory() as session:
+        await reconcile_budget(session, scope=GLOBAL_SCOPE)
+
 
 # create_all() creates missing TABLES; it never alters an existing one.
 # So a column added to a model after its table already exists is simply
@@ -74,4 +89,6 @@ async def init_db(engine: AsyncEngine) -> None:
 _ADDITIVE_COLUMNS = (
     "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS input_tokens INTEGER",
     "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS output_tokens INTEGER",
+    "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INTEGER",
+    "ALTER TABLE agent_actions ADD COLUMN IF NOT EXISTS cache_read_input_tokens INTEGER",
 )

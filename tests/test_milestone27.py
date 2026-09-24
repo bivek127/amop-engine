@@ -87,13 +87,13 @@ def test_model_response_keeps_cache_tokens_separate_from_input_tokens():
     distinct fields."""
     response = ModelResponse(
         content="x",
-        input_tokens=100,
+        uncached_input_tokens=100,
         output_tokens=50,
         cache_creation_input_tokens=2000,
         cache_read_input_tokens=8000,
         model="m",
     )
-    assert response.input_tokens == 100
+    assert response.uncached_input_tokens == 100
     assert response.cache_creation_input_tokens == 2000
     assert response.cache_read_input_tokens == 8000
 
@@ -270,7 +270,7 @@ async def test_claude_complete_parses_usage_including_cache_tokens(monkeypatch):
     )
 
     assert response.content == '{"final_answer": "done"}'
-    assert response.input_tokens == 120
+    assert response.uncached_input_tokens == 120
     assert response.output_tokens == 30
     assert response.cache_creation_input_tokens == 1000
     assert response.cache_read_input_tokens == 9000
@@ -348,7 +348,13 @@ async def test_openai_maps_its_own_differently_shaped_schema(monkeypatch):
     assert json.loads(response.content) == {
         "tool_call": {"name": "read_file", "arguments": {"path": "b.py"}}
     }
-    assert response.input_tokens == 80
+    # Milestone 32 fix: unlike Anthropic's usage.input_tokens (already
+    # excludes cached tokens), OpenAI's prompt_tokens (80) INCLUDES
+    # cached_tokens (64) -- so the real uncached count is 80 - 64 = 16,
+    # not 80. Asserting 80 here would have been asserting the bug this
+    # milestone fixed (double-counting the 64 cached tokens once here
+    # and again via cache_read_input_tokens in the cost formula).
+    assert response.uncached_input_tokens == 16
     assert response.output_tokens == 20
     assert response.cache_read_input_tokens == 64
 
