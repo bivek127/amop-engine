@@ -211,7 +211,13 @@ async def triage_anomaly(
         task_context={
             "prompt": alert.summary,
             "repo": alert.repo,
-            "source": "github_watcher",
+            # alert.source is "github" for every pre-existing caller (its
+            # own default), so this is byte-identical to the previous
+            # hardcoded "github_watcher" for every GitHub-sourced alert --
+            # a real, additive fix for the newly-added "logs" source
+            # (orchestrator/monitoring.py), which otherwise would have
+            # been mislabeled github_watcher in its own audit trail.
+            "source": f"{alert.source}_watcher",
             "github_issue_number": alert.github_issue_number,
             "severity": alert.severity,
             "confidence": alert.confidence,

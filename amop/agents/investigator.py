@@ -14,8 +14,10 @@ threshold itself is enforced in orchestrator/chain.py, not here — this
 agent only has to report its confidence honestly, and cannot route
 around the consequence.
 
-Spec tools not built yet (search_logs, git_log, git_blame,
-get_error_rate) are out of scope this milestone. Milestone 5 adds
+Spec tools search_logs/get_error_rate now exist (amop/tools/monitoring.py)
+but are deliberately not wired into this agent's `tools` tuple yet --
+that's a separate task from building them, and this agent's own scope
+here is unchanged. git_log/git_blame remain unbuilt. Milestone 5 adds
 search_code (Section 7.3) -- on a repo bigger than a couple of files,
 reading everything doesn't scale, which is exactly what this agent needs
 Codebase Intelligence for.

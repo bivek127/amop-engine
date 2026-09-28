@@ -16,6 +16,7 @@ from amop.memory import store as memory_store
 from amop.models.ollama import DEFAULT_MODEL, OllamaProvider
 from amop.orchestrator.chain import persist_chain_result, resume_fix, run_fix
 from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
+from amop.orchestrator.monitoring import LOG_SOURCE_REPO, check_log_threshold
 from amop.orchestrator.optimize import MIN_IMPROVEMENT_PCT, run_optimization
 from amop.orchestrator.reporting import run_report
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
@@ -25,6 +26,7 @@ from amop.safety import circuit_breakers
 from amop.safety.untrusted_input import wrap_untrusted
 from amop.sandbox import tools as sandbox_tools  # noqa: F401 -- registers the sandboxed tools
 from amop.tools import github as github_tools  # noqa: F401 -- registers list_open_issues
+from amop.tools import monitoring as monitoring_tools  # noqa: F401 -- registers search_logs/get_metrics/get_error_rate/list_recent_errors
 from amop.tools.registry import ToolContext, invoke_tool
 
 # Placeholder actor for the CLI's demo path through TRIAGING/INVESTIGATING/
@@ -339,9 +341,10 @@ async def _resume(task_id: str, model: str, mode: str) -> None:
     "--model", default=DEFAULT_MODEL, show_default=True, help="Ollama model to use."
 )
 def watch(repo: str | None, local_path: str | None, interval: int, model: str) -> None:
-    """Poll a GitHub repo's open issues on an interval, dedupe against
-    existing tasks, and create real bug_fix Tasks for qualifying
-    anomalies (Section 6.1)."""
+    """Poll a repo's open GitHub issues and (if AMOP_LOG_SOURCE_REPO is
+    configured, see amop/orchestrator/monitoring.py) its log-based error
+    rate on an interval, dedupe against existing tasks, and create real
+    bug_fix Tasks for qualifying anomalies (Section 6.1)."""
     asyncio.run(_watch(repo, Path(local_path) if local_path else None, interval, model))
 
 
@@ -485,6 +488,19 @@ async def _watch(
 
 
 async def _poll_once(session_factory, repo: str, local_path: Path | None, provider) -> None:
+    """One poll cycle for one watched repo, across every configured
+    signal source. Section 6.1's failure-handling rule is "a data-source
+    read failure ... is logged and that source is skipped for the
+    cycle" -- each source below therefore gets its own try/except, not
+    one shared one, so a GitHub API hiccup can never suppress the
+    logs/metrics check for the same cycle, and vice versa. Before this,
+    the GitHub source's own internal `return`s on failure already
+    achieved per-repo isolation (the outer `_watch` loop's try/except)
+    but not per-source isolation within one repo's cycle -- there was
+    only ever one source to isolate from itself. Adding a second,
+    independent source is what makes that distinction real for the
+    first time.
+    """
     async with session_factory() as session:
         ctx = ToolContext(
             agent_name="watcher",
@@ -493,62 +509,109 @@ async def _poll_once(session_factory, repo: str, local_path: Path | None, provid
             db_session=session,
         )
 
-        result = await invoke_tool(
-            "list_open_issues", {"repo": repo}, ctx, agent_name="orchestrator"
+        try:
+            await _poll_github_issues(session, ctx, repo, local_path, provider)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: isolate, don't fail the cycle
+            click.echo(f"  [github: data-source read failed, skipping this cycle] {exc}")
+
+        try:
+            await _poll_log_threshold(session, ctx, repo, local_path, provider)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: isolate, don't fail the cycle
+            click.echo(f"  [logs: data-source read failed, skipping this cycle] {exc}")
+
+
+async def _poll_github_issues(
+    session, ctx: ToolContext, repo: str, local_path: Path | None, provider
+) -> None:
+    result = await invoke_tool(
+        "list_open_issues", {"repo": repo}, ctx, agent_name="orchestrator"
+    )
+    if not result.success:
+        click.echo(f"  list_open_issues failed: {result.error_code}: {result.message}")
+        return
+    issues = result.output
+
+    # Dedup layer 1a: cheap, exact match. Filters BEFORE the issue
+    # ever reaches Watcher's prompt -- a filtered issue was never a
+    # real candidate for this cycle.
+    candidates = []
+    for issue in issues:
+        existing = await find_existing_task_for_issue(session, repo, issue["number"])
+        if existing is None:
+            candidates.append(issue)
+
+    if not candidates:
+        click.echo(f"  {len(issues)} open issue(s), 0 new candidates")
+        return
+
+    rate_check = await circuit_breakers.check_anomaly_rate(session, repo)
+    if not rate_check.allow:
+        click.echo(f"  META-ALERT (anomaly_rate_breaker): {rate_check.reason}")
+        return
+
+    click.echo(f"  {len(issues)} open issue(s), {len(candidates)} new candidate(s)")
+    prompt = _build_watcher_prompt(candidates)
+    watcher = WatcherAgent(provider, ctx)
+    agent_result = await watcher.run(prompt)
+
+    if not agent_result.success or agent_result.handoff is None:
+        click.echo(f"  watcher classification failed: {agent_result.error}")
+        return
+
+    for alert in agent_result.handoff.alerts:
+        if not (1 <= alert.issue_index <= len(candidates)):
+            click.echo(f"  skipping alert with out-of-range issue_index={alert.issue_index}")
+            continue
+        issue = candidates[alert.issue_index - 1]
+        stamped = alert.model_copy(
+            update={"repo": repo, "github_issue_number": issue["number"]}
         )
-        if not result.success:
-            click.echo(f"  list_open_issues failed: {result.error_code}: {result.message}")
-            return
-        issues = result.output
+        click.echo(
+            f"  AnomalyAlert: #{issue['number']} \"{issue['title']}\" "
+            f"severity={stamped.severity} confidence={stamped.confidence}"
+        )
+        task = await triage_anomaly(
+            session,
+            stamped,
+            local_path=local_path,
+            model=provider,
+            emit=lambda message: click.echo(f"    {message}"),
+        )
+        if task is not None:
+            click.echo(f"    -> task {task.id}, final state this cycle: {task.state}")
 
-        # Dedup layer 1a: cheap, exact match. Filters BEFORE the issue
-        # ever reaches Watcher's prompt -- a filtered issue was never a
-        # real candidate for this cycle.
-        candidates = []
-        for issue in issues:
-            existing = await find_existing_task_for_issue(session, repo, issue["number"])
-            if existing is None:
-                candidates.append(issue)
 
-        if not candidates:
-            click.echo(f"  {len(issues)} open issue(s), 0 new candidates")
-            return
+async def _poll_log_threshold(
+    session, ctx: ToolContext, repo: str, local_path: Path | None, provider
+) -> None:
+    """The logs/metrics half of Section 6.1 (amop/orchestrator/monitoring.py),
+    wired into the same poll cycle as the GitHub path above. Gated on
+    AMOP_LOG_SOURCE_REPO so every pre-existing `amop watch` invocation
+    (no log source configured) is a silent no-op here, same as before
+    this module existed.
+    """
+    if LOG_SOURCE_REPO is None or repo != LOG_SOURCE_REPO:
+        return
 
-        rate_check = await circuit_breakers.check_anomaly_rate(session, repo)
-        if not rate_check.allow:
-            click.echo(f"  META-ALERT (anomaly_rate_breaker): {rate_check.reason}")
-            return
+    alert = await check_log_threshold(
+        session, repo, ctx, emit=lambda message: click.echo(f"  {message}")
+    )
+    if alert is None:
+        return
 
-        click.echo(f"  {len(issues)} open issue(s), {len(candidates)} new candidate(s)")
-        prompt = _build_watcher_prompt(candidates)
-        watcher = WatcherAgent(provider, ctx)
-        agent_result = await watcher.run(prompt)
-
-        if not agent_result.success or agent_result.handoff is None:
-            click.echo(f"  watcher classification failed: {agent_result.error}")
-            return
-
-        for alert in agent_result.handoff.alerts:
-            if not (1 <= alert.issue_index <= len(candidates)):
-                click.echo(f"  skipping alert with out-of-range issue_index={alert.issue_index}")
-                continue
-            issue = candidates[alert.issue_index - 1]
-            stamped = alert.model_copy(
-                update={"repo": repo, "github_issue_number": issue["number"]}
-            )
-            click.echo(
-                f"  AnomalyAlert: #{issue['number']} \"{issue['title']}\" "
-                f"severity={stamped.severity} confidence={stamped.confidence}"
-            )
-            task = await triage_anomaly(
-                session,
-                stamped,
-                local_path=local_path,
-                model=provider,
-                emit=lambda message: click.echo(f"    {message}"),
-            )
-            if task is not None:
-                click.echo(f"    -> task {task.id}, final state this cycle: {task.state}")
+    click.echo(
+        f"  AnomalyAlert (logs): severity={alert.severity} "
+        f"confidence={alert.confidence} -- {alert.summary}"
+    )
+    task = await triage_anomaly(
+        session,
+        alert,
+        local_path=local_path,
+        model=provider,
+        emit=lambda message: click.echo(f"    {message}"),
+    )
+    if task is not None:
+        click.echo(f"    -> task {task.id}, final state this cycle: {task.state}")
 
 
 @app.command()
