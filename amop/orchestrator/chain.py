@@ -527,6 +527,52 @@ async def run_chain(
         result.stages.append(message)
         emit(message)
 
+    code_report: CodeChangeReport | None = None
+
+    async def apply_size_cap_if_over(diff: str) -> bool:
+        """Section 29.1's diff-size cap. Factored out so it can be
+        reused from the no-op-but-already-passing path added below
+        (M29/M33's fix): that path skips the normal pre-TESTING size-cap
+        call site (gated on status == "success", which a no_op
+        CodeChangeReport never is) since it only knows it wants to
+        proceed to REVIEWING *after* TESTING has already run -- but a
+        diff must never reach REVIEWING uncapped regardless of which
+        path got it there. Returns True if it fired (a NEEDS_HUMAN_INPUT
+        transition already happened; the caller must `return result`
+        immediately), False if the diff is within cap.
+        """
+        nonlocal code_report
+        if not scope_guard.over_cap(diff):
+            return False
+        loc = scope_guard.changed_line_count(diff)
+        code_report = code_report.model_copy(
+            update={
+                "status": "needs_decomposition",
+                "failure_diagnostic": (
+                    f"diff is {loc} changed lines, exceeding the "
+                    f"{scope_guard.MAX_LOC_PER_TASK}-line cap (Section 29.1)"
+                ),
+            }
+        )
+        result.code_change_report = code_report
+        stage(
+            f"CODING: diff exceeds size cap ({loc} > "
+            f"{scope_guard.MAX_LOC_PER_TASK}) -- needs_decomposition"
+        )
+        await go(
+            TaskState.NEEDS_HUMAN_INPUT,
+            actor=f"agent:{agents.coder.name}",
+            trigger=(
+                f"diff exceeds coder.max_loc_per_task cap "
+                f"({loc} > {scope_guard.MAX_LOC_PER_TASK})"
+            ),
+        )
+        stage(
+            "NEEDS_HUMAN_INPUT: diff too large for one task -- "
+            "decompose into smaller changes"
+        )
+        return True
+
     try:
         if resume_report is not None:
             # Milestone 29 / spec 4.6.2: RECONCILE already re-validated
@@ -750,37 +796,13 @@ async def run_chain(
             # CoderAgent's loop -- a smaller, lower-risk change, still a
             # real code-enforced gate: an oversized edit never reaches
             # TESTING, let alone PR_CREATION. Only checked on a genuine,
-            # trusted new diff (status == "success") -- a no_op/failed
-            # attempt is handled by its own retry path below regardless of
-            # how large a stale earlier-attempt diff happens to be.
-            if code_report.status == "success" and scope_guard.over_cap(full_diff):
-                loc = scope_guard.changed_line_count(full_diff)
-                code_report = code_report.model_copy(
-                    update={
-                        "status": "needs_decomposition",
-                        "failure_diagnostic": (
-                            f"diff is {loc} changed lines, exceeding the "
-                            f"{scope_guard.MAX_LOC_PER_TASK}-line cap (Section 29.1)"
-                        ),
-                    }
-                )
-                result.code_change_report = code_report
-                stage(
-                    f"CODING: diff exceeds size cap ({loc} > "
-                    f"{scope_guard.MAX_LOC_PER_TASK}) -- needs_decomposition"
-                )
-                await go(
-                    TaskState.NEEDS_HUMAN_INPUT,
-                    actor=f"agent:{agents.coder.name}",
-                    trigger=(
-                        f"diff exceeds coder.max_loc_per_task cap "
-                        f"({loc} > {scope_guard.MAX_LOC_PER_TASK})"
-                    ),
-                )
-                stage(
-                    "NEEDS_HUMAN_INPUT: diff too large for one task -- "
-                    "decompose into smaller changes"
-                )
+            # trusted new diff (status == "success") here -- a plain
+            # no_op/failed attempt is handled by its own retry path below
+            # regardless of how large a stale earlier-attempt diff
+            # happens to be. (The no-op-but-already-passing path below
+            # applies this same cap itself, after TESTING, since it only
+            # learns it wants to proceed to REVIEWING at that point.)
+            if code_report.status == "success" and await apply_size_cap_if_over(full_diff):
                 return result
 
             # -- TESTING ---------------------------------------------
@@ -792,16 +814,51 @@ async def run_chain(
             result.test_report = test_report
             stage(f"TESTING: all_passed={test_report.all_passed} — {test_report.details[:160]}")
 
-            # Bugfix: a no-op coding attempt (zero mutating tool calls)
-            # must never reach Reviewer with a stale diff, and getting
-            # lucky on a leftover passing suite doesn't change that.
-            # Handled before route_after_testing so it can never fall
-            # through to REVIEWING regardless of test outcome. Uses its
-            # own small budget (MAX_NOOP_ATTEMPTS) instead of consuming
-            # a real fix_iterations/review_cycles slot -- this isn't the
-            # test-failure or review-rejection retry path, it's "the
-            # coder didn't actually do anything, try again."
-            if code_report.no_op:
+            # Bugfix (originally): a no-op coding attempt (zero mutating
+            # tool calls) must never reach Reviewer with a stale diff,
+            # and getting lucky on a leftover passing suite doesn't
+            # change that -- true for a *fresh* task, where a passing
+            # suite with no new edit really is just luck against an
+            # unrelated pre-existing state.
+            #
+            # M29/M33 correction: that reasoning breaks down for a
+            # *resumed* task. M29's own live kill-and-restart demo hit
+            # this directly -- a crash-recovered fix that already
+            # re-passed the real suite 10/10, twice, still landed
+            # FAILED, because the guard could not tell "the Coder is
+            # stalling" apart from "the Coder correctly made no edit
+            # because the recovered fix was already complete and
+            # verified correct." Both used to burn the same
+            # MAX_NOOP_ATTEMPTS budget. Now: only a no-op attempt whose
+            # tests are NOT already passing counts against that budget --
+            # a genuine stall (zero tool calls, failing tests) still
+            # discards and retries exactly as before this fix.
+            if code_report.no_op and test_report.all_passed:
+                # This attempt's own full_diff/files_changed are real
+                # and cumulative (git_repo.changed_files/diff_against_
+                # baseline diff against the task's baseline, not just
+                # this turn -- see _run_coder's docstring), so this is
+                # never an empty-diff handoff even though no NEW tool
+                # call happened this turn. The pre-TESTING size-cap
+                # check above was skipped for this attempt (it's gated
+                # on status == "success", which a no_op CodeChangeReport
+                # never is) -- apply the same cap now, since a diff
+                # reaching REVIEWING must always have passed it
+                # regardless of which path got it there.
+                code_report = code_report.model_copy(update={"status": "success"})
+                result.code_change_report = code_report
+                if await apply_size_cap_if_over(full_diff):
+                    return result
+                stage(
+                    "CODING: no new mutating tool call this attempt, but the "
+                    "test suite already passes -- treating as a correct "
+                    "no-edit-needed decision, not a stall; proceeding to "
+                    "review like a normal passing attempt"
+                )
+                # Deliberately no `continue` -- falls through to the same
+                # route_after_testing() call below as an ordinary
+                # successful attempt.
+            elif code_report.no_op:
                 noop_attempts += 1
                 stage(
                     f"CODING: discarding no-op attempt ({noop_attempts}/"

@@ -121,15 +121,22 @@ as it happens (not just at hand-off), so a crashed orchestrator can
 reconcile a task's real git state against the database on restart across
 six defined divergence cases, rather than silently losing or duplicating
 work — demonstrated with a real kill -9 mid-task and a real recovered
-resume.
+resume. A resumed task whose fix was already correct (the coder makes no
+further edit, but the real test suite already passes) is now correctly
+reported as success rather than misclassified as a stall and discarded —
+demonstrated live with a real, unscripted model call.
 
 ### Interfaces
 A REST API, a Telegram bot, and a web dashboard all share the same
 underlying task-creation and control-layer code — no interface has a
 privileged bypass path. Bugs reach AMOP via manual submission (CLI, API,
-Telegram, or a submit form on the dashboard), polling (`amop watch`), or
-GitHub webhooks (real HMAC-SHA256 signature verification, delivery-ID
-idempotency). Submitting a `bug_fix` task through the API or the
+Telegram, or a submit form on the dashboard), polling (`amop watch` —
+which also runs a log/metric error-rate threshold rule against a real
+running process, file-tail based since no Prometheus is deployed here,
+independently isolated from the GitHub-issue path so a failure in one
+never blocks the other), or GitHub webhooks (real HMAC-SHA256 signature
+verification, delivery-ID idempotency). Submitting a `bug_fix` task
+through the API or the
 dashboard now schedules the fix chain to run in the background
 automatically — you don't need a second terminal command to make it
 start. The dashboard's task-detail page shows a task's real pipeline
@@ -158,7 +165,10 @@ into a more flattering summary.
   (missing trailing newline, stale-context diffs from an earlier turn or
   a prior failed retry) are now fixed and enforced mechanically. A third,
   narrower cause — the model targeting the right region but
-  mistranscribing it — is identified but still open. This gap is
+  mistranscribing it — is identified but still open; real diff/file-
+  content evidence for it is now durably captured automatically when it
+  recurs (not investigated yet, but no longer lost to terminal scrollback
+  the way an earlier round of this exact evidence was). This gap is
   **partially closed, not solved**.
 - **The Reviewer's live approval rate is largely unmeasured under the
   current mechanism.** The current Reviewer actually executes a

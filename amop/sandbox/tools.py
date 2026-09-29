@@ -23,6 +23,7 @@ import re
 import shlex
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from pathlib import Path
 
 from amop.safety.engine import resolve_within_scratch
@@ -32,6 +33,16 @@ from amop.tools.registry import ToolContext, ToolResult, tool
 
 SCRATCH_DIR = Path(os.environ.get("AMOP_SCRATCH_DIR", "./amop_workspace")).resolve()
 SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# Durable capture for the still-unexplained "gate passed, diff still
+# didn't apply" residual case named in Milestone 30's own closing note
+# ("leaving a separate diff-construction failure mode isolated rather
+# than hidden behind it") -- a distinct directory from SCRATCH_DIR
+# because scratch dirs are per-task and get cleaned up (Milestone 25/31);
+# a diagnostic capture must outlive the task it came from. Never
+# committed -- see .gitignore.
+DIAGNOSTICS_DIR = Path(os.environ.get("AMOP_DIAGNOSTICS_DIR", "./amop_diagnostics")).resolve()
+_DIAGNOSTICS_MAX_CONTENT_CHARS = 100_000
 
 # Section 6.3.7: sandbox.test_timeout_seconds, default 300s for a full
 # suite. The tool's own timeout_seconds sits just above it so the
@@ -646,6 +657,70 @@ def _read_covers_target(
     return read_lo <= target_lo and target_hi <= read_hi
 
 
+def _truncate_for_capture(text: str) -> str:
+    if len(text) <= _DIAGNOSTICS_MAX_CONTENT_CHARS:
+        return text
+    omitted = len(text) - _DIAGNOSTICS_MAX_CONTENT_CHARS
+    return f"{text[:_DIAGNOSTICS_MAX_CONTENT_CHARS]}...[truncated {omitted} chars]"
+
+
+def _capture_unexplained_patch_conflict(
+    ctx: ToolContext,
+    *,
+    path: str,
+    diff: str,
+    current_content: str,
+    target_range: tuple[int, int] | None,
+    read_range: tuple[int, int] | None,
+    stage: str,
+    message: str,
+) -> None:
+    """Not a fix -- a trail. By the time patch_file reaches either of its
+    two PATCH_CONFLICT returns, the Milestone 30 gate above has ALREADY
+    let this attempt through (a stale/insufficient read is rejected
+    earlier, as STALE_READ, before git apply is ever invoked). So a
+    PATCH_CONFLICT reaching this point, during a real CoderAgent turn,
+    is specifically the residual case Milestone 30's own commit message
+    named but never itself investigated: "leaving a separate diff-
+    construction failure mode isolated rather than hidden behind it" --
+    referred to since as the "correct region, wrong transcription" gap.
+
+    `agent_actions` (Milestone 23) already durably records this call's
+    `diff` argument and a 2000-char-capped summary of the failure
+    message -- real durability, but not enough to diagnose *why* a
+    diff with fresh, sufficient context still failed to apply, because
+    it never captures the file's actual content being compared against.
+    This writes a companion snapshot with both sides of that comparison,
+    uncapped up to a generous bound, to a location that outlives the
+    task's own scratch dir (Milestone 25/31 clean those up).
+
+    Best-effort and never fatal, same discipline as
+    audit/actions.py's record_action: a diagnostics-write failure must
+    never turn an already-failed (but otherwise normal) tool call into a
+    crashed one.
+    """
+    try:
+        DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+        task_id = getattr(ctx, "task_id", None)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+        filename = f"patch_conflict_{task_id or 'no-task'}_{stamp}_{uuid.uuid4().hex[:8]}.json"
+        payload = {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "task_id": str(task_id) if task_id is not None else None,
+            "agent_name": getattr(ctx, "agent_name", None),
+            "path": path,
+            "git_apply_stage": stage,
+            "conflict_message": message,
+            "target_range": list(target_range) if target_range else None,
+            "read_range": list(read_range) if read_range else None,
+            "diff": _truncate_for_capture(diff),
+            "current_content": _truncate_for_capture(current_content),
+        }
+        (DIAGNOSTICS_DIR / filename).write_text(json.dumps(payload, indent=2))
+    except Exception:  # noqa: BLE001 -- diagnostics capture is never allowed to be fatal
+        pass
+
+
 @tool(
     name="patch_file",
     description=(
@@ -699,6 +774,13 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
     # touching the sandbox at all -- a stale-context attempt never
     # reaches git apply, matching Milestone 17's own named fix: "reject
     # it before it ever reaches git apply."
+    #
+    # target_range/read_range initialized here (not just inside the
+    # branches below) so the still-unexplained-conflict capture further
+    # down always has a defined value to report, including the
+    # gate-inactive case (ctx.coder_read_tracking is None).
+    target_range: tuple[int, int] | None = None
+    read_range: tuple[int, int] | None = None
     if ctx.coder_read_tracking is not None:
         target_range = _diff_target_range(diff)
         if target_range is not None:
@@ -759,20 +841,44 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
             ctx.sandbox.exec_run, f"git apply --check --recount {patch_path}"
         )
         if check.exit_code != 0:
+            conflict_message = _conflict_message(check.stderr, check.stdout)
+            if ctx.coder_read_tracking is not None:
+                _capture_unexplained_patch_conflict(
+                    ctx,
+                    path=path,
+                    diff=diff,
+                    current_content=current_content,
+                    target_range=target_range,
+                    read_range=read_range,
+                    stage="check",
+                    message=conflict_message,
+                )
             return ToolResult(
                 success=False,
                 error_code="PATCH_CONFLICT",
-                message=_conflict_message(check.stderr, check.stdout),
+                message=conflict_message,
             )
 
         applied = await asyncio.to_thread(
             ctx.sandbox.exec_run, f"git apply --recount {patch_path}"
         )
         if applied.exit_code != 0:
+            conflict_message = _conflict_message(applied.stderr, applied.stdout)
+            if ctx.coder_read_tracking is not None:
+                _capture_unexplained_patch_conflict(
+                    ctx,
+                    path=path,
+                    diff=diff,
+                    current_content=current_content,
+                    target_range=target_range,
+                    read_range=read_range,
+                    stage="apply",
+                    message=conflict_message,
+                )
             return ToolResult(
                 success=False,
                 error_code="PATCH_CONFLICT",
-                message=_conflict_message(applied.stderr, applied.stdout),
+                message=conflict_message,
             )
     except Exception as exc:
         return ToolResult(success=False, error_code="PATCH_ERROR", message=str(exc))

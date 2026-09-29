@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 .venv/
 amop_workspace/
+amop_diagnostics/

@@ -502,6 +502,105 @@ async def test_tester_claiming_success_cannot_override_a_failing_suite(session, 
     assert history.count(TaskState.CODING.value) == MAX_NOOP_ATTEMPTS
 
 
+# -- M29/M33 fix: a no-op with an already-passing suite is success, ---
+# -- not a stall --------------------------------------------------------
+
+
+async def test_no_op_with_already_passing_tests_is_treated_as_success(session, workspace):
+    """Reproduces the real historical scenario named in Milestone 29's
+    own findings (and reconfirmed live during the Milestone 33 no-op-
+    guard synthesis): the no-op guard used to be unable to tell "the
+    Coder is stalling" apart from "the Coder correctly made no edit
+    because the fix was already applied and verified correct" -- M29's
+    own live kill-and-restart demo hit this exactly, where a crash-
+    recovered fix that re-passed the real suite 10/10, twice, still
+    landed FAILED.
+
+    Simulated here the same shape a real crash-recovered branch would
+    have: the real, known-good fix is committed onto the working branch
+    BEFORE the chain's first CODING attempt even runs (standing in for
+    RECONCILE having already recovered it pre-crash) -- not something
+    this test's own scripted Coder does. The Coder then makes zero
+    write_file/patch_file calls, exactly like the real live demo.
+    """
+    ctx, scratch, sandbox = workspace
+    task = await create_task(session, task_type="bug_fix")
+
+    # The real fix, already on the branch -- standing in for a
+    # crash-recovered task whose RECONCILE-restored state already has
+    # this commit, before this attempt's Coder turn ever runs.
+    fixed_source = fixed_calculator_source(scratch)
+    (scratch / "calculator.py").write_text(fixed_source)
+    git_repo.commit_all(sandbox, "pre-existing fix (simulates a crash-recovered branch)")
+
+    agents = build_agents(
+        ctx,
+        investigator=[root_cause_answer(0.9)],
+        # Zero mutating tool calls -- the Coder correctly sees nothing
+        # left to do, same as the real M29 demo.
+        coder=[final("the fix is already applied and correct -- no change needed")],
+        tester=[suite_answer(True, "all green")],
+        reviewer=[tool_call("get_diff"), review_answer(True)],
+    )
+
+    result = await run_chain(
+        session, task, description="average is wrong", ctx=ctx, agents=agents
+    )
+
+    # Must proceed to a real PR, not FAILED -- this is the actual fix
+    # under test: success, not a discarded no-op.
+    assert result.final_state is TaskState.WAITING_FOR_APPROVAL, result.error
+    assert result.code_change_report.no_op is True
+    assert result.code_change_report.status == "success"
+
+    history = await state_history(session, task.id)
+    # Exactly one CODING entry -- proceeded straight through, never
+    # looped on the no-op retry path.
+    assert history.count(TaskState.CODING.value) == 1
+    assert TaskState.REVIEWING.value in history
+
+    # And the fix genuinely is the real one, still on disk -- not an
+    # empty/fabricated diff reaching Reviewer.
+    assert FIXED_LINE in (scratch / "calculator.py").read_text()
+    ground_truth = await invoke_tool("run_tests", {}, ctx, agent_name="test")
+    assert ground_truth.output["all_passed"]
+
+
+async def test_no_op_with_failing_tests_still_triggers_the_guard_and_fails(session, workspace):
+    """Companion to the success case above -- proves the fix didn't just
+    disable the no-op guard. Same zero-tool-call Coder, but the bug is
+    still genuinely present (no pre-applied fix this time), so the real
+    suite genuinely fails: must still discard as no-op and land FAILED
+    after MAX_NOOP_ATTEMPTS, exactly as before this change. Structurally
+    the same shape as
+    test_tester_claiming_success_cannot_override_a_failing_suite above,
+    kept as its own explicit test here because it's the direct control
+    case for the fix this file section is about, not incidental to it.
+    """
+    ctx, scratch, sandbox = workspace
+    task = await create_task(session, task_type="bug_fix")
+
+    agents = build_agents(
+        ctx,
+        investigator=[root_cause_answer(0.9)],
+        coder=[final("I decided no change was needed")],
+        tester=[suite_answer(False, "still red -- bug is genuinely present")],
+        reviewer=[review_answer(True)],
+    )
+
+    result = await run_chain(
+        session, task, description="average is wrong", ctx=ctx, agents=agents
+    )
+
+    assert result.final_state is TaskState.FAILED
+    assert result.code_change_report.no_op is True
+    assert result.test_report.all_passed is False
+
+    history = await state_history(session, task.id)
+    assert TaskState.REVIEWING.value not in history
+    assert history.count(TaskState.CODING.value) == MAX_NOOP_ATTEMPTS
+
+
 # -- reviewer rejection loops back ------------------------------------
 
 
