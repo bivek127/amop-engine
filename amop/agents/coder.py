@@ -136,9 +136,12 @@ class CoderAgent(BaseAgent):
         within one task (chain.py's CODING loop), each a fresh
         conversation via a fresh run() call -- a stale range tracked
         from an earlier attempt's now-irrelevant messages must never
-        silently satisfy this attempt's own gate.
+        silently satisfy this attempt's own gate. Milestone 36's
+        coder_read_numbered companion dict is reset the same way, for
+        the same reason.
         """
         self.ctx.coder_read_tracking = {}
+        self.ctx.coder_read_numbered = {}
         if self.ctx.sandbox is not None:
             self.last_container_id = self.ctx.sandbox.short_id
             return await self._run_loop(prompt)

@@ -228,7 +228,16 @@ async def test_patch_file_conflict_message_names_the_exact_mismatch(
             agent_name="test",
         )
         assert not result.success
-        assert result.error_code == "PATCH_CONFLICT"
+        # Milestone 36: this diff's claimed context ("line THREE-not-
+        # really") is fabricated -- it appears nowhere in the real file
+        # -- so it's now caught by the pre-flight content-fidelity check
+        # before ever reaching git apply, with a more precise error code.
+        # The message keeps the same specificity this test originally
+        # pinned (which line, what was claimed, what's really there);
+        # _check_content_fidelity reuses the same position-anchored walk
+        # _diagnose_context_mismatch always used, purely for diagnostic
+        # detail here.
+        assert result.error_code == "CONTENT_MISMATCH"
         assert "line 3" in result.message  # the real content
         assert "line THREE-not-really" in result.message  # what the diff wrongly assumed
         assert (tmp_path / "target.txt").read_text() == "line 1\nline 2\nline 3\n"

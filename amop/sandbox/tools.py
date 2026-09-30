@@ -115,6 +115,7 @@ def _track_read(
     path: str,
     start_line: int | None,
     end_line: int | None,
+    numbered: bool,
     result: "ToolResult",
 ) -> None:
     """Milestone 30: record what a successful read_file call actually
@@ -123,12 +124,25 @@ def _track_read(
     CoderAgent turn (see ToolContext's own docstring). Defined here,
     ahead of read_file_effective_range's own definition further down in
     this module, which is fine -- Python resolves the name at call
-    time, well after the whole module has finished loading."""
+    time, well after the whole module has finished loading.
+
+    Milestone 36: also records whether the OUTPUT actually shown was
+    numbered ('N: ' prefixed) -- not simply the `with_line_numbers`
+    argument, since the oversized-whole-file truncation branch forces
+    numbering on regardless of what was asked (see its own call site
+    below). This is what patch_file's gate checks in addition to
+    coverage: a real historical case (Milestone 35's diagnostic
+    captures ee31f113/d3799905) shows a covering-but-UNNUMBERED
+    whole-file read still let a badly-miscounted patch_file attempt
+    through -- coverage alone was never enough for the specific
+    unscoped-whole-file shape, only for a deliberately-scoped read."""
     if ctx.coder_read_tracking is None:
         return
     rng = read_file_effective_range(start_line, end_line, result)
     if rng is not None:
         ctx.coder_read_tracking[path] = rng
+        if ctx.coder_read_numbered is not None:
+            ctx.coder_read_numbered[path] = numbered
 
 
 def _scoped_default_notice(size_bytes: int, total_lines: int, shown_lines: int) -> str:
@@ -229,10 +243,13 @@ async def read_file(
             lines = content.splitlines(keepends=True)
             total_lines = len(lines)
             shown = lines[:_SCOPED_READ_DEFAULT_LINES]
-            numbered = "".join(f"{i + 1}: {line}" for i, line in enumerate(shown))
+            numbered_body = "".join(f"{i + 1}: {line}" for i, line in enumerate(shown))
             notice = _scoped_default_notice(size, total_lines, len(shown))
-            result = ToolResult(success=True, output=notice + numbered)
-            _track_read(ctx, path, start_line, end_line, result)
+            result = ToolResult(success=True, output=notice + numbered_body)
+            # Always numbered here regardless of the with_line_numbers
+            # argument -- this branch forces line numbers on so a
+            # follow-up scoped read can target an exact line.
+            _track_read(ctx, path, start_line, end_line, True, result)
             return result
 
     try:
@@ -284,7 +301,7 @@ async def read_file(
             else:
                 body = "".join(capped)
             result = ToolResult(success=True, output=notice + body)
-            _track_read(ctx, path, start_line, end_line, result)
+            _track_read(ctx, path, start_line, end_line, with_line_numbers, result)
             return result
 
         if with_line_numbers:
@@ -294,7 +311,7 @@ async def read_file(
             )
         else:
             result = ToolResult(success=True, output="".join(selected))
-        _track_read(ctx, path, start_line, end_line, result)
+        _track_read(ctx, path, start_line, end_line, with_line_numbers, result)
         return result
 
     total_lines = content.count("\n") + 1
@@ -306,7 +323,7 @@ async def read_file(
         content = _large_file_notice(content, total_lines) + content
 
     result = ToolResult(success=True, output=content)
-    _track_read(ctx, path, start_line, end_line, result)
+    _track_read(ctx, path, start_line, end_line, with_line_numbers, result)
     return result
 
 
@@ -492,23 +509,18 @@ def _normalize_diff_headers(diff: str, relative_path: str) -> str:
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
 
 
-def _diagnose_context_mismatch(diff: str, current_content: str) -> str | None:
-    """After git apply has ALREADY rejected a diff, look for the specific
-    reason and describe it precisely -- never used to decide accept/
-    reject, only to explain a rejection git apply already made (that
-    decision stays 100% git apply's, same boundary
-    `_normalize_diff_headers` documents).
-
-    Milestone 17: found live, then confirmed by direct reproduction --
-    two of three recovered PATCH_CONFLICT diffs listed a line as
-    unchanged *context* whose text didn't match the file's real current
-    content (specifically: text matching what an EARLIER, also-rejected
-    attempt in the same retry loop would have produced, had it landed).
-    `git apply`'s own message for this ("patch does not apply") doesn't
-    say which line or what's actually there, so a retrying agent has to
-    guess. This walks the same line-accounting git apply does and
-    reports the first mismatch directly: the line number, what the diff
-    assumed, and what the file actually contains right now.
+def _find_context_mismatch(
+    diff: str, current_content: str
+) -> tuple[int, str, str, str] | None:
+    """The shared walk behind both _diagnose_context_mismatch (explains
+    an actual git apply rejection, after the fact) and
+    _check_content_fidelity (Milestone 36's pre-flight gate, before git
+    apply ever runs) -- same line-accounting git apply itself does,
+    factored out once so the two callers can never silently drift
+    apart. Returns (line_no, marker, expected, actual) for the first
+    context (' ') or removed ('-') line whose claimed content doesn't
+    match the file's real content at that line number, or None if every
+    context/removed line matches.
     """
     real_lines = current_content.splitlines()
     lines = diff.splitlines()
@@ -528,17 +540,227 @@ def _diagnose_context_mismatch(diff: str, current_content: str) -> str | None:
             expected = line[1:]
             actual = real_lines[old_line_no - 1] if 0 <= old_line_no - 1 < len(real_lines) else None
             if actual is not None and actual != expected:
-                claim = "unchanged context" if line[0] == " " else "a line to remove"
-                return (
-                    f"line {old_line_no} of the diff assumes (as {claim}): "
-                    f"{expected!r} -- but the file's real current line "
-                    f"{old_line_no} is: {actual!r}. This diff looks like it "
-                    "was built against an intended future version of the "
-                    "file, not what's actually there -- re-read this exact "
-                    "region fresh and construct a new diff against it, "
-                    "rather than adjusting the same one again."
-                )
+                return old_line_no, line[0], expected, actual
             old_line_no += 1
+    return None
+
+
+def _diagnose_context_mismatch(diff: str, current_content: str) -> str | None:
+    """After git apply has ALREADY rejected a diff, look for the specific
+    reason and describe it precisely -- never used to decide accept/
+    reject, only to explain a rejection git apply already made (that
+    decision stays 100% git apply's, same boundary
+    `_normalize_diff_headers` documents). Milestone 36: with
+    _check_content_fidelity now catching this same mismatch shape
+    BEFORE git apply runs, this function should rarely fire in
+    practice -- kept as a backstop for whatever a pre-flight check
+    doesn't cover (e.g. a real conflict git apply detects for a reason
+    outside this walk's scope), so a genuine, un-pre-empted git apply
+    rejection still gets a precise explanation rather than git's own
+    opaque message.
+
+    Milestone 17: found live, then confirmed by direct reproduction --
+    two of three recovered PATCH_CONFLICT diffs listed a line as
+    unchanged *context* whose text didn't match the file's real current
+    content (specifically: text matching what an EARLIER, also-rejected
+    attempt in the same retry loop would have produced, had it landed).
+    `git apply`'s own message for this ("patch does not apply") doesn't
+    say which line or what's actually there, so a retrying agent has to
+    guess. This walks the same line-accounting git apply does and
+    reports the first mismatch directly: the line number, what the diff
+    assumed, and what the file actually contains right now.
+    """
+    mismatch = _find_context_mismatch(diff, current_content)
+    if mismatch is None:
+        return None
+    old_line_no, marker, expected, actual = mismatch
+    claim = "unchanged context" if marker == " " else "a line to remove"
+    return (
+        f"line {old_line_no} of the diff assumes (as {claim}): "
+        f"{expected!r} -- but the file's real current line "
+        f"{old_line_no} is: {actual!r}. This diff looks like it "
+        "was built against an intended future version of the "
+        "file, not what's actually there -- re-read this exact "
+        "region fresh and construct a new diff against it, "
+        "rather than adjusting the same one again."
+    )
+
+
+def _hunk_old_side_sequences(diff: str) -> list[list[str]]:
+    """Every hunk's old-side line sequence (context ' ' + removed '-'
+    lines, marker stripped, in order) -- one list per hunk. Used by the
+    position-independent half of _check_content_fidelity below."""
+    sequences: list[list[str]] = []
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("@@"):
+            i += 1
+            continue
+        i += 1
+        seq: list[str] = []
+        while i < len(lines) and not lines[i].startswith("@@"):
+            line = lines[i]
+            i += 1
+            if not line or line[0] not in " -":
+                continue
+            seq.append(line[1:])
+        if seq:
+            sequences.append(seq)
+    return sequences
+
+
+def _sequence_appears(seq: list[str], real_lines: list[str]) -> bool:
+    """Does `seq` appear as a contiguous, exact block anywhere in
+    real_lines -- regardless of position?"""
+    n = len(seq)
+    if n == 0:
+        return True
+    for start in range(len(real_lines) - n + 1):
+        if real_lines[start : start + n] == seq:
+            return True
+    return False
+
+
+def _check_content_fidelity(
+    diff: str, current_content: str, *, position_trustworthy: bool
+) -> str | None:
+    """Milestone 35/36's pre-flight content-fidelity gate: rejects a
+    diff BEFORE git apply ever runs when its transcription of the
+    file's content is unfaithful -- but deliberately does NOT reject a
+    diff whose content is faithful and merely mis-positioned, per
+    Milestone 35/36's own diagnosis: replaying the task's own real
+    successful patch (an 8-line header miscount, confirmed via direct
+    git apply replay) showed a wrong position with faithful content
+    still applies cleanly -- git's own matching tolerates it. Position
+    error alone must not become a new false-positive rejection here.
+
+    Two modes, chosen by the caller based on whether the model's own
+    most recent read of this region was numbered (`position_trustworthy`):
+
+    - **Numbered read (strict, position-anchored):** the model was just
+      shown exact line numbers for this exact region. Any context/
+      removed line that doesn't match the file's real content AT THE
+      POSITION THE DIFF ITSELF CLAIMS is a genuine transcription fault
+      -- it had perfect information and still got it wrong. This is
+      what caught the two real dropped/misaligned-content captures
+      (Milestone 35's b0ae5a10, c1cef787), both preceded by a numbered
+      read that plainly contradicts what the diff went on to claim.
+
+    - **Unnumbered (or no tracked read at all) read (lenient,
+      position-independent):** the model had no reliable position
+      signal to begin with, so a position mismatch alone proves
+      nothing about content fidelity -- this is exactly the real
+      successful case's own shape (a scoped-but-unnumbered read, header
+      off by 8, content correct). Instead, check whether each hunk's
+      old-side line sequence appears as a contiguous, exact block
+      *anywhere* in the file. If it does, the transcription is faithful
+      even though the claimed position isn't -- let it through to git
+      apply (which may still apply it, per the same evidence). If it
+      appears nowhere at all, the content itself is fabricated or
+      garbled, independent of position, and is rejected here.
+
+    Distinct error code (CONTENT_MISMATCH) from the generic
+    PATCH_CONFLICT git apply itself raises, so the two failure shapes
+    stay separately diagnosable going forward.
+    """
+    if position_trustworthy:
+        mismatch = _find_context_mismatch(diff, current_content)
+        if mismatch is None:
+            return None
+        line_no, marker, expected, actual = mismatch
+        claim = "unchanged context" if marker == " " else "a line to remove"
+        return (
+            f"line {line_no} of the diff assumes (as {claim}): {expected!r} "
+            f"-- but the file's real current line {line_no} is: {actual!r}. "
+            "You were just shown this exact region, numbered, moments ago "
+            "-- this diff's content does not match what you saw. Re-read "
+            "this exact region fresh (with_line_numbers=true) and "
+            "transcribe it exactly into your diff, rather than from "
+            "memory or an earlier attempt."
+        )
+
+    real_lines = current_content.splitlines()
+    for seq in _hunk_old_side_sequences(diff):
+        if not _sequence_appears(seq, real_lines):
+            # The decision (reject) is position-independent -- but the
+            # message doesn't have to be vague about it. Reuse the
+            # position-anchored walk purely for diagnostic detail (which
+            # line, what was claimed, what's really there), same
+            # specificity M17 originally built _diagnose_context_mismatch
+            # for -- it just isn't what DECIDED this rejection.
+            anchored = _find_context_mismatch(diff, current_content)
+            if anchored is not None:
+                line_no, marker, expected, actual = anchored
+                claim = "unchanged context" if marker == " " else "a line to remove"
+                detail = (
+                    f"line {line_no} of the diff assumes (as {claim}): "
+                    f"{expected!r} -- but the file's real current line "
+                    f"{line_no} is: {actual!r}. "
+                )
+            else:
+                detail = ""
+            preview = seq[0] if seq else ""
+            return (
+                f"{detail}A hunk's context/removed lines (starting "
+                f"{preview!r}) do not appear as a contiguous, exact block "
+                "ANYWHERE in the file's real current content -- regardless "
+                "of position. This diff's content is fabricated or "
+                "garbled, not just mis-positioned. Re-read the region "
+                "you're actually targeting (with_line_numbers=true) and "
+                "construct a new diff that transcribes its real content "
+                "exactly."
+            )
+    return None
+
+
+def _find_diff_format_defect(diff: str) -> str | None:
+    """Milestone 36's pre-flight format gate, checked before either the
+    freshness gate or the content-fidelity check above: purely
+    syntactic, never reads file content. Every line inside a hunk body
+    must start with ' ' (context), '-' (removed), '+' (added), or '\\'
+    (the standard "\\ No newline at end of file" marker) -- and must
+    never be truly empty, since a blank CONTEXT line has to be
+    represented as a single space, not zero characters.
+
+    Real historical case (Milestone 35's diagnostic capture
+    `d3799905`, task 637c1bda): every context line was missing its
+    leading marker character entirely -- indistinguishable from a
+    well-formed marker+content line by a pure first-character check
+    alone when the real content itself starts with whitespace (Python
+    indentation), which is exactly why this diff's blank line (which
+    should be a single space, ' ') being fully empty is the reliable,
+    unambiguous signal this check catches -- not an attempt to detect
+    every possible missing-marker line by content inspection (that
+    residual case is what _check_content_fidelity catches next, since
+    a markerless line's stripped-by-one-character "content" won't
+    match the real file either).
+    """
+    lines = diff.splitlines()
+    in_hunk = False
+    for lineno, line in enumerate(lines, start=1):
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if line.startswith(("diff --git", "index ", "--- ", "+++ ")):
+            in_hunk = False
+            continue
+        if not in_hunk:
+            continue
+        if line == "":
+            return (
+                f"line {lineno} of the diff is empty inside a hunk body -- "
+                "a blank context line must be a single space (' '), never "
+                "zero characters. Malformed diff, rejected before ever "
+                "reaching git apply."
+            )
+        if line[0] not in " -+\\":
+            return (
+                f"line {lineno} of the diff ({line!r}) does not start with "
+                "a valid unified-diff marker (' ' for context, '-' for "
+                "removed, '+' for added). Malformed diff, rejected before "
+                "ever reaching git apply."
+            )
     return None
 
 
@@ -733,13 +955,21 @@ def _capture_unexplained_patch_conflict(
         "'--- '/'+++ ' header lines (the path in them is ignored -- only "
         "the 'path' argument matters), then one or more hunks starting "
         "'@@ -start,count +start,count @@', with context lines prefixed "
-        "by a space, removed lines by '-', added lines by '+'. Rejected "
-        "with error_code=PATCH_CONFLICT if the diff doesn't apply cleanly "
-        "(e.g. you read stale content, or got the location wrong) -- "
-        "re-read the current file/region first, then retry with a fresh "
-        "diff; never resubmit the same one unchanged. Use write_file "
-        "instead for a brand new file or a genuinely trivial single-line "
-        "change."
+        "by a space, removed lines by '-', added lines by '+' -- every "
+        "such line needs its marker character, even a blank context "
+        "line (a single space, never truly empty). Three checks run "
+        "before git apply ever sees the diff: error_code=MALFORMED_DIFF "
+        "if a hunk line is missing its marker; error_code=STALE_READ if "
+        "the most recent read_file on this path doesn't cover the "
+        "diff's target lines, or was an unnumbered whole-file read (call "
+        "read_file again with with_line_numbers=true); "
+        "error_code=CONTENT_MISMATCH if a context or removed line "
+        "doesn't match the file's real current content at that line. "
+        "error_code=PATCH_CONFLICT means it passed all three checks but "
+        "git apply itself still rejected it. Any of these: re-read the "
+        "current file/region first, then retry with a fresh diff; never "
+        "resubmit the same one unchanged. Use write_file instead for a "
+        "brand new file or a genuinely trivial single-line change."
     ),
     parameters={
         "type": "object",
@@ -767,7 +997,18 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
             message="no sandbox session for this task",
         )
 
-    # Milestone 30: forced-fresh-read gate. Only active during a real
+    # Milestone 36, check 3 of 3: diff-format validation. Runs first of
+    # all three pre-flight checks below, and needs no file access at
+    # all -- purely syntactic, so it's the cheapest and most decisive
+    # rejection to reach first when it applies.
+    format_defect = _find_diff_format_defect(diff)
+    if format_defect is not None:
+        return ToolResult(
+            success=False, error_code="MALFORMED_DIFF", message=format_defect
+        )
+
+    # Milestone 30: forced-fresh-read gate (coverage), extended by
+    # Milestone 36, check 1 of 3 (numbered). Only active during a real
     # CoderAgent turn (ctx.coder_read_tracking is not None -- see
     # ToolContext's own docstring); every other caller, including every
     # test that calls patch_file directly, is unaffected. Checked before
@@ -808,6 +1049,36 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
                         "diff against what you actually just saw."
                     ),
                 )
+            # Milestone 36, check 1: coverage alone isn't enough for an
+            # unscoped whole-file read (read_range's own sentinel value
+            # for "no start_line/end_line given at all" -- see
+            # read_file_effective_range) -- it trivially "covers"
+            # anything, but two real captured cases (Milestone 35's
+            # ee31f113/d3799905) show that's not the same as the model
+            # actually knowing where things are. A deliberately scoped
+            # read is treated differently even when also unnumbered --
+            # it's a bounded, intentional request, not a guess across an
+            # arbitrarily long, uncounted file (and Milestone 35's own
+            # successful 8-line-miscount replay came from exactly this
+            # scoped-unnumbered shape, which must keep working).
+            if read_range == (1, _UNBOUNDED_END) and not (
+                ctx.coder_read_numbered or {}
+            ).get(path, False):
+                return ToolResult(
+                    success=False,
+                    error_code="STALE_READ",
+                    message=(
+                        f"the most recent read_file on {path!r} covered the "
+                        "whole file, but as an unnumbered, unscoped "
+                        "whole-file read -- not enough for patch_file to "
+                        "trust the position this diff claims. Call "
+                        "read_file again with with_line_numbers=true "
+                        "(scoped to the region you're editing, or the "
+                        "whole file if it's small) so you know the real "
+                        "line numbers before constructing the diff's '@@' "
+                        "header."
+                    ),
+                )
 
     container_path = _container_path(target, ctx.scratch_dir)
     relative_path = container_path.removeprefix("/workspace/")
@@ -822,6 +1093,32 @@ async def patch_file(path: str, diff: str, ctx: ToolContext) -> ToolResult:
         )
     except Exception as exc:
         return ToolResult(success=False, error_code="READ_ERROR", message=str(exc))
+
+    # Milestone 36, check 2 of 3: content fidelity. Runs after the gate
+    # above (which needs no file content) but still before git apply --
+    # the actual decisive factor per Milestone 35/36's diagnosis (see
+    # _check_content_fidelity's own docstring). Distinct error code from
+    # PATCH_CONFLICT so this failure shape stays separately diagnosable
+    # in agent_actions going forward, rather than blending into git
+    # apply's generic rejection.
+    #
+    # position_trustworthy: strict, position-anchored checking only
+    # when we KNOW the model just saw accurate line numbers for this
+    # exact, covering region -- never for an unnumbered read (gate-
+    # active or not), where a position mismatch alone proves nothing
+    # (the real successful 8-line-miscount case has exactly this shape:
+    # a scoped-but-unnumbered read, wrong header, faithful content).
+    position_trustworthy = bool(
+        ctx.coder_read_tracking is not None
+        and (ctx.coder_read_numbered or {}).get(path, False)
+    )
+    fidelity_defect = _check_content_fidelity(
+        diff, current_content, position_trustworthy=position_trustworthy
+    )
+    if fidelity_defect is not None:
+        return ToolResult(
+            success=False, error_code="CONTENT_MISMATCH", message=fidelity_defect
+        )
 
     normalized = _normalize_diff_headers(diff, relative_path)
     patch_path = f"/tmp/amop-patch-{uuid.uuid4().hex}.diff"

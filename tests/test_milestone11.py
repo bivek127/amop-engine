@@ -129,8 +129,14 @@ async def test_patch_file_rejects_stale_diff_without_corrupting_the_file(tmp_pat
             "patch_file", {"path": "target.txt", "diff": STALE_DIFF}, ctx, agent_name="test"
         )
         assert not result.success
-        assert result.error_code == "PATCH_CONFLICT"
-        # File untouched -- git apply --check caught it before any write.
+        # Milestone 36: this diff's claimed content ("this context does
+        # not match the real file") doesn't appear anywhere in the real
+        # file -- caught by the new pre-flight content-fidelity check
+        # before ever reaching git apply, with a more precise error code
+        # than the generic PATCH_CONFLICT git apply itself would have
+        # raised for the same underlying reason.
+        assert result.error_code == "CONTENT_MISMATCH"
+        # File untouched -- caught before any write.
         assert (tmp_path / "target.txt").read_text() == FIVE_LINES
     finally:
         sandbox_manager.destroy("t-patch-stale")

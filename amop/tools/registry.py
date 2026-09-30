@@ -99,6 +99,19 @@ class ToolContext:
     # weight for them.
     coder_read_tracking: dict[str, tuple[int, int]] | None = None
 
+    # Milestone 36: whether the read tracked above (per path) actually
+    # showed numbered ('N: '-prefixed) output. Same None-means-off,
+    # CoderAgent.run()-resets-it-to-{}-per-attempt lifecycle as
+    # coder_read_tracking, kept as a separate dict rather than widening
+    # that one's tuple type so every existing direct construction of
+    # coder_read_tracking (tests included) keeps working unchanged.
+    # patch_file's gate uses this in addition to coverage: a real
+    # historical case (Milestone 35/36's diagnostic captures) showed an
+    # unscoped, UNNUMBERED whole-file read still "covering" a target
+    # range (trivially -- it covers everything) was not actually enough
+    # signal for the model to get the diff's position right.
+    coder_read_numbered: dict[str, bool] | None = None
+
 
 @dataclass
 class ToolResult:
