@@ -31,6 +31,7 @@ from amop.interfaces.web.auth import (
     require_web_session,
     token_is_valid,
 )
+from amop.orchestrator import pause as pause_mod
 from amop.orchestrator.state_machine import TERMINAL_STATES, TaskState
 from amop.orchestrator.task import get_transitions
 
@@ -147,9 +148,31 @@ async def task_list(
             }
         )
 
+    pause_state = await pause_mod.get_state(session)
+
     return templates.TemplateResponse(
-        request, "tasks.html", {"groups": groups, "show_logout": True}
+        request,
+        "tasks.html",
+        {"groups": groups, "show_logout": True, "pause_state": pause_state},
     )
+
+
+@router.post("/pause", dependencies=[Depends(require_web_session)])
+async def web_pause(session: AsyncSession = Depends(get_session)) -> RedirectResponse:
+    """Section 12.7's emergency shutdown, from the dashboard -- the
+    natural place for it is right where a human is already looking at
+    live task state, not a new page. Calls orchestrator/pause.py
+    directly (same DB session dependency as every other route here),
+    matching this router's own established pattern of reading the same
+    rows the API/CLI use rather than making an HTTP call to itself."""
+    await pause_mod.set_paused(session, paused=True, by="web")
+    return RedirectResponse(url="/web/tasks", status_code=303)
+
+
+@router.post("/resume", dependencies=[Depends(require_web_session)])
+async def web_resume(session: AsyncSession = Depends(get_session)) -> RedirectResponse:
+    await pause_mod.set_paused(session, paused=False, by="web")
+    return RedirectResponse(url="/web/tasks", status_code=303)
 
 
 @router.get(

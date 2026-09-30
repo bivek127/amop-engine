@@ -1,7 +1,8 @@
 """Telegram Bot — spec Section 16.1, scoped down to CLAUDE.md's own list
-of five commands: `/status`, `/ask`, `/report`, `/approve`, `/reject`.
-Not built (explicitly out per CLAUDE.md's own scope): `/set_mode`,
-`/pause`, `/resume`.
+of five commands: `/status`, `/ask`, `/report`, `/approve`, `/reject`,
+now joined by `/pause` and `/resume` (Section 12.7's emergency
+shutdown -- previously named here as explicitly deferred; built now).
+Still not built: `/set_mode`.
 
 An API CLIENT, not a privileged path (Section 3.1's Command Layer):
 every command here calls the Stage 1 REST API over `httpx`, holding the
@@ -349,6 +350,48 @@ async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------
+# /pause and /resume -- Section 12.7's emergency shutdown, exposed
+# through the exact same Command Layer as every other command in this
+# file (POST /system/pause, /system/resume). No local state, no
+# privileged path -- this bot is just another caller of the one real
+# API endpoint that also backs `amop pause`/`amop unpause` (CLI) and
+# the web dashboard's own control, if wired.
+# ---------------------------------------------------------------------
+
+
+async def _pause_or_resume(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str
+) -> None:
+    if not _is_allowed(update):
+        return await _reject_unauthorized(update)
+    user = update.effective_user
+    by = f"telegram:{user.username or user.id}" if user else "telegram"
+    r = await _api_post(f"/system/{action}", json={"by": by})
+    if r.status_code != 200:
+        await update.message.reply_text(f"Could not {action} ({r.status_code}).")
+        return
+    state = r.json()
+    if action == "pause":
+        await update.message.reply_text(
+            f"⏸ PAUSED by {state['paused_by']}. In-flight work finishes "
+            "its current step; no new task-state transitions start until "
+            "/resume."
+        )
+    else:
+        await update.message.reply_text(
+            "▶️ RESUMED. Any held transitions proceed now."
+        )
+
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _pause_or_resume(update, context, "pause")
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _pause_or_resume(update, context, "resume")
+
+
+# ---------------------------------------------------------------------
 # Proactive notifications -- CLAUDE.md's "simple poll-and-notify loop is
 # fine" allowance, taken literally: no new API surface, just periodic
 # GET /tasks?state= calls diffed against what was seen last tick.
@@ -397,6 +440,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("approve", approve_command))
     application.add_handler(CommandHandler("reject", reject_command))
+    application.add_handler(CommandHandler("pause", pause_command))
+    application.add_handler(CommandHandler("resume", resume_command))
 
     if application.job_queue is not None:
         application.job_queue.run_repeating(

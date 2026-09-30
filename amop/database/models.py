@@ -470,3 +470,31 @@ class Budget(Base):
     spent_usd: Mapped[float] = mapped_column(Numeric, nullable=False, default=0)
 
     __table_args__ = (PrimaryKeyConstraint("scope", "period_start"),)
+
+
+class OrchestratorPause(Base):
+    """Spec Section 12.7 / ADR-10: the durable emergency-shutdown flag.
+
+    A real, single-row Postgres table -- deliberately not an in-memory
+    flag, per the spec's own "stays paused across a process restart
+    until explicitly resumed" requirement. `id` is always 1 (a
+    singleton row, same "fixed key, no read-then-decide race" shape as
+    `Budget`'s composite key above, just simpler since there's only
+    ever one real row here rather than one per scope/day).
+
+    Read by `orchestrator/task.py::transition()` -- the one function
+    every real state change in this codebase already funnels through
+    (chain.py's CODING/TESTING/REVIEWING loop, watch.py's triage,
+    cli/main.py's approve/reject/cancel flows, the API's task routes) --
+    so gating there, once, covers every caller without touching any of
+    them individually.
+    """
+
+    __tablename__ = "orchestrator_pause"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    paused_by: Mapped[str | None] = mapped_column(Text)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from amop.orchestrator.chain import persist_chain_result, resume_fix, run_fix
 from amop.orchestrator.deps import DEFAULT_PERMISSION_MODE, run_dependency_update
 from amop.orchestrator.monitoring import LOG_SOURCE_REPO, check_log_threshold
 from amop.orchestrator.optimize import MIN_IMPROVEMENT_PCT, run_optimization
+from amop.orchestrator import pause as pause_mod
 from amop.orchestrator.reporting import run_report
 from amop.orchestrator.state_machine import IllegalTransitionError, TaskState
 from amop.orchestrator.task import create_task, get_task, get_transitions, transition
@@ -654,6 +656,75 @@ async def _status(task_id: uuid.UUID) -> None:
             f"  [{t.timestamp}] {t.from_state or '(none)'} -> {t.to_state}"
             f"  trigger={t.trigger!r} actor={t.actor!r}"
         )
+
+
+# Section 12.7 / ADR-10's emergency shutdown. Named `pause`/`unpause`,
+# not `pause`/`resume` -- `amop resume <task_id>` already exists
+# (Milestone 29, crash-recovery for one stranded task) and means
+# something entirely different from "resume the whole orchestrator".
+# Telegram's /pause and /resume don't have this collision (no existing
+# /resume command there) and use the spec's own literal names.
+@app.command()
+def pause() -> None:
+    """Section 12.7 emergency shutdown: set the durable pause flag.
+    In-flight tool calls complete; no new task-state transitions start
+    (new or in-progress tasks alike) until `amop unpause`."""
+    asyncio.run(_pause())
+
+
+async def _pause() -> None:
+    engine = make_engine()
+    await init_db(engine)
+    session_factory = make_session_factory(engine)
+    async with session_factory() as session:
+        row = await pause_mod.set_paused(
+            session, paused=True, by=os.environ.get("USER", "operator")
+        )
+    click.echo(
+        f"PAUSED at {row.paused_at} by {row.paused_by!r}. "
+        "In-flight work will finish its current step and then hold. "
+        "Run `amop unpause` to resume."
+    )
+    await engine.dispose()
+
+
+@app.command()
+def unpause() -> None:
+    """Clear the pause flag set by `amop pause`. Any task-state
+    transition that was held waiting proceeds immediately."""
+    asyncio.run(_unpause())
+
+
+async def _unpause() -> None:
+    engine = make_engine()
+    await init_db(engine)
+    session_factory = make_session_factory(engine)
+    async with session_factory() as session:
+        row = await pause_mod.set_paused(
+            session, paused=False, by=os.environ.get("USER", "operator")
+        )
+    click.echo(f"RESUMED at {row.resumed_at}. New transitions will proceed.")
+    await engine.dispose()
+
+
+@app.command("pause-status")
+def pause_status() -> None:
+    """Show whether the orchestrator is currently paused."""
+    asyncio.run(_pause_status())
+
+
+async def _pause_status() -> None:
+    engine = make_engine()
+    await init_db(engine)
+    session_factory = make_session_factory(engine)
+    async with session_factory() as session:
+        row = await pause_mod.get_state(session)
+    if row.paused:
+        click.echo(f"PAUSED since {row.paused_at} by {row.paused_by!r}")
+    else:
+        resumed_note = f" (last resumed {row.resumed_at})" if row.resumed_at else ""
+        click.echo(f"Not paused{resumed_note}.")
+    await engine.dispose()
 
 
 @app.command()

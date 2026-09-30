@@ -6,6 +6,18 @@
     display: flex; justify-content: space-between; align-items: flex-end;
     margin-bottom: 1.5rem; gap: 1rem; flex-wrap: wrap;
   }
+  .pause-banner {
+    display: flex; align-items: center; gap: .75rem;
+    padding: .6rem 1rem; margin-bottom: 1rem; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface);
+    font-size: .85rem;
+  }
+  .pause-banner-idle { opacity: .7; }
+  .pause-banner form { margin: 0; }
+  .pause-banner button {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: .3rem .8rem; cursor: pointer; font-size: .8rem;
+  }
   .search-box { position: relative; width: 280px; max-width: 100%; }
   .search-box input {
     width: 100%; padding-left: 2.1rem; background: var(--surface);
@@ -69,6 +81,22 @@
 </style>
 {% endblock %}
 {% block content %}
+{% if pause_state and pause_state.paused %}
+<div class="pause-banner">
+  <span class="badge amber"><span class="dot"></span>PAUSED</span>
+  <span>by {{ pause_state.paused_by }} at {{ pause_state.paused_at | relative_time }} &mdash; in-flight work finishes its current step; no new task-state transitions start.</span>
+  <form method="post" action="/web/resume" style="margin-left:auto">
+    <button type="submit">Resume</button>
+  </form>
+</div>
+{% else %}
+<div class="pause-banner pause-banner-idle">
+  <span class="badge green"><span class="dot"></span>RUNNING</span>
+  <form method="post" action="/web/pause">
+    <button type="submit">Pause</button>
+  </form>
+</div>
+{% endif %}
 <div class="list-header">
   <div>
     <h1>Tasks</h1>

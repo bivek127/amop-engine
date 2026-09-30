@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from amop.audit.chain import append_chained
 from amop.database.models import Task, TaskTransition
+from amop.orchestrator import pause as pause_mod
 from amop.orchestrator.state_machine import (
     TERMINAL_STATES,
     IllegalTransitionError,
@@ -74,7 +75,16 @@ async def transition(
     row to task_transitions before returning. Raises
     IllegalTransitionError for an invalid move — nothing is written in
     that case.
+
+    Section 12.7 / ADR-10: checked first, before anything else in this
+    function -- every real state change in this codebase goes through
+    here, so this one call is what makes `amop pause` global. Blocks
+    (this coroutine only, not the process) until resumed; see
+    orchestrator/pause.py's own docstring for why that's safe and why
+    it never interrupts an already-in-flight agent turn.
     """
+    await pause_mod.wait_while_paused(session)
+
     from_state = TaskState(task.state)
     spec_trigger = validate_transition(from_state, to_state)
 

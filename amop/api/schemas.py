@@ -121,3 +121,21 @@ class MemoryDisputeUpdate(BaseModel):
     """PATCH /memory/{id} body -- Section 10.4's dispute toggle."""
 
     disputed: bool = True
+
+
+class PauseRequest(BaseModel):
+    """POST /system/pause and /system/resume body -- Section 12.7.
+    `by` is optional free text for the audit record (who/what triggered
+    this); the shared-token auth this endpoint sits behind has no
+    per-caller identity of its own to fall back on."""
+
+    by: str | None = None
+
+
+class PauseStateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    paused: bool
+    paused_by: str | None = None
+    paused_at: datetime | None = None
+    resumed_at: datetime | None = None
