@@ -17,6 +17,7 @@ with.
 """
 
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -622,6 +623,95 @@ def _sequence_appears(seq: list[str], real_lines: list[str]) -> bool:
     return False
 
 
+_NEAREST_BLOCK_MAX_SHOWN = 12
+
+
+def _locate_nearest_block(seq: list[str], real_lines: list[str]) -> int | None:
+    """0-indexed start of the window of `real_lines` that `seq` most
+    plausibly meant to transcribe, or None if nothing in the file
+    resembles it. Every non-blank line of `seq` votes for the window
+    start that would line it up with a whitespace-insensitive match;
+    the most-voted start wins (earliest on ties). Purely a locator for
+    the rejection message -- never used to decide accept/reject, or to
+    rewrite the diff."""
+    by_stripped: dict[str, list[int]] = {}
+    for idx, real in enumerate(real_lines):
+        stripped = real.strip()
+        if stripped:
+            by_stripped.setdefault(stripped, []).append(idx)
+    votes: dict[int, int] = {}
+    for offset, claimed in enumerate(seq):
+        stripped = claimed.strip()
+        if not stripped:
+            continue
+        for idx in by_stripped.get(stripped, ()):
+            start = idx - offset
+            if start >= 0:
+                votes[start] = votes.get(start, 0) + 1
+    if not votes:
+        return None
+    return min(votes, key=lambda start: (-votes[start], start))
+
+
+def _describe_transcription_error(seq: list[str], real_lines: list[str]) -> str | None:
+    """Explain HOW a hunk's old-side block differs from the nearest real
+    block, and show that real block verbatim, so a retry can copy it
+    instead of re-guessing. Added for the "right region, mistranscribed"
+    failure: the pre-flight gate already rejected these, but only named
+    the first bad line -- not where the real text lives or whether the
+    defect was indentation, a dropped/added line, or a garbled token.
+    Returns None when no nearby real block can be identified."""
+    start = _locate_nearest_block(seq, real_lines)
+    if start is None:
+        return None
+    window = real_lines[start : start + len(seq) + 2]
+    matcher = difflib.SequenceMatcher(None, seq, window, autojunk=False)
+    problems: list[str] = []
+    opcodes = matcher.get_opcodes()
+    for n, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        if tag == "equal":
+            continue
+        if tag == "replace" and n == len(opcodes) - 1 and (j2 - j1) > (i2 - i1):
+            # The slack lines past the claimed block get merged into the
+            # final replace; they aren't part of the transcription.
+            j2 = j1 + (i2 - i1)
+        if tag == "insert" and i1 >= len(seq):
+            continue  # real lines past the end of the claimed block aren't a defect
+        claimed = seq[i1:i2]
+        actual = window[j1:j2]
+        first = start + j1 + 1
+        if tag == "replace" and len(claimed) == len(actual):
+            for k, (c, a) in enumerate(zip(claimed, actual)):
+                kind = (
+                    "indentation/whitespace differs only"
+                    if c.strip() == a.strip()
+                    else "text differs"
+                )
+                problems.append(
+                    f"diff has {c!r} but file line {first + k} is {a!r} ({kind})"
+                )
+        elif tag == "delete":
+            problems.append(f"diff has extra line(s) not in the file: {claimed!r}")
+        elif tag == "insert":
+            problems.append(
+                f"diff dropped real file line(s) starting at line {first}: {actual!r}"
+            )
+        else:
+            problems.append(
+                f"diff has {claimed!r} where the file (from line {first}) has {actual!r}"
+            )
+    if not problems:
+        return None
+    shown = window[: _NEAREST_BLOCK_MAX_SHOWN]
+    block = "\n".join(f"{start + n + 1}: {line}" for n, line in enumerate(shown))
+    more = "" if len(window) <= len(shown) else "\n..."
+    return (
+        f"Closest real block starts at line {start + 1}. Differences: "
+        + "; ".join(problems[:5])
+        + f".\nReal text there:\n{block}{more}"
+    )
+
+
 def _check_content_fidelity(
     diff: str, current_content: str, *, position_trustworthy: bool
 ) -> str | None:
@@ -664,13 +754,15 @@ def _check_content_fidelity(
     PATCH_CONFLICT git apply itself raises, so the two failure shapes
     stay separately diagnosable going forward.
     """
+    real_lines = current_content.splitlines()
+
     if position_trustworthy:
         mismatch = _find_context_mismatch(diff, current_content)
         if mismatch is None:
             return None
         line_no, marker, expected, actual = mismatch
         claim = "unchanged context" if marker == " " else "a line to remove"
-        return (
+        message = (
             f"line {line_no} of the diff assumes (as {claim}): {expected!r} "
             f"-- but the file's real current line {line_no} is: {actual!r}. "
             "You were just shown this exact region, numbered, moments ago "
@@ -679,8 +771,17 @@ def _check_content_fidelity(
             "transcribe it exactly into your diff, rather than from "
             "memory or an earlier attempt."
         )
+        # Detail only: the first hunk that isn't an exact block anywhere
+        # is the one worth explaining; a faithful-but-misplaced hunk
+        # gets the message above unchanged.
+        for seq in _hunk_old_side_sequences(diff):
+            if not _sequence_appears(seq, real_lines):
+                detail = _describe_transcription_error(seq, real_lines)
+                if detail is not None:
+                    message = f"{message}\n{detail}"
+                break
+        return message
 
-    real_lines = current_content.splitlines()
     for seq in _hunk_old_side_sequences(diff):
         if not _sequence_appears(seq, real_lines):
             # The decision (reject) is position-independent -- but the
@@ -701,7 +802,7 @@ def _check_content_fidelity(
             else:
                 detail = ""
             preview = seq[0] if seq else ""
-            return (
+            message = (
                 f"{detail}A hunk's context/removed lines (starting "
                 f"{preview!r}) do not appear as a contiguous, exact block "
                 "ANYWHERE in the file's real current content -- regardless "
@@ -711,6 +812,8 @@ def _check_content_fidelity(
                 "construct a new diff that transcribes its real content "
                 "exactly."
             )
+            nearest = _describe_transcription_error(seq, real_lines)
+            return f"{message}\n{nearest}" if nearest is not None else message
     return None
 
 
